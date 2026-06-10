@@ -1,20 +1,24 @@
 #!/usr/bin/env node
 import { readFile, writeFile, mkdir, readdir } from 'node:fs/promises';
-import { createReadStream, existsSync, realpathSync, statSync } from 'node:fs';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { chmodSync, createReadStream, existsSync, realpathSync, statSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { join, resolve, dirname, delimiter } from 'node:path';
 import { homedir } from 'node:os';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
+import pty from 'node-pty';
 
 const DEFAULT_PRICE_URL =
   'https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json';
 
+const require = createRequire(import.meta.url);
 const DEFAULT_PRICE_CACHE = join(homedir(), '.cache', 'codex-meter', 'prices.litellm.json');
 const DEFAULT_SESSIONS_DIR = join(homedir(), '.codex', 'sessions');
 const DEFAULT_CODEX_CONFIG = join(homedir(), '.codex', 'config.toml');
 const DEFAULT_TMUX_HEIGHT = 2;
+const PTY_FOOTER_HEIGHT = 1;
 const UNKNOWN_MODEL = 'unknown';
 const DEFAULT_CODEX_STATUS_LINE = [
   'model-with-reasoning',
@@ -48,7 +52,7 @@ function usage() {
     '  --watch                 Recalculate continuously without model/API calls',
     '  --interval SECONDS      Watch interval (default: 2)',
     '  --status                Print one compact line',
-    '  --launch                Launch Codex with a managed live meter pane',
+    '  --launch                Launch Codex with a live meter pane/footer',
     '  --tmux                  Open a bottom tmux pane and run live compact status there',
     '  --tmux-height LINES     Bottom tmux pane height (default: 2)',
     '  --json                  Print machine-readable JSON',
@@ -535,7 +539,7 @@ async function setupCodexStatusLine({ configPath }) {
   await mkdir(dirname(configPath), { recursive: true });
   await writeFile(configPath, updated);
   process.stdout.write(`codex-meter setup updated ${configPath}\n`);
-  process.stdout.write('Codex built-in status_line now includes token and limit items. Custom since/cost meter still requires launch mode with tmux/psmux for a live pane.\n');
+  process.stdout.write('Codex built-in status_line now includes token and limit items. Use `codex-meter launch ...` for the custom since/cost live meter.\n');
 }
 
 function upsertCodexStatusLineText(configText) {
@@ -777,13 +781,17 @@ async function launchTmuxPane({ commandArgs, options }) {
   process.stdout.write(`codex-meter live pane launched below (${options.tmuxHeight} lines).\n`);
 }
 
-async function launchManagedCodexSession({ commandArgs, options }) {
-  const tmuxBin = resolveWorkingTmuxBinary();
-  if (!tmuxBin) {
-    runCodexDirect(options.codexArgs);
+async function launchManagedCodexSession({ commandArgs, since, options }) {
+  const launchMode = selectLaunchMode();
+  if (launchMode.kind === 'pty-footer') {
+    await launchPtyFooterSession({ since, options });
     return;
   }
+  if (launchMode.kind === 'unsupported') {
+    throw new Error('no-tmux launch mode requires an interactive terminal.');
+  }
 
+  const tmuxBin = launchMode.tmuxBin;
   if (options.refreshPrices) {
     await refreshPrices({ priceUrl: options.priceUrl, pricePath: options.pricePath });
   }
@@ -830,6 +838,204 @@ async function launchManagedCodexSession({ commandArgs, options }) {
     }
     throw new Error(`managed launch failed: ${error.message}`);
   }
+}
+
+function selectLaunchMode({
+  tmuxBin = resolveWorkingTmuxBinary(),
+  stdinIsTTY = process.stdin.isTTY,
+  stdoutIsTTY = process.stdout.isTTY,
+} = {}) {
+  if (tmuxBin) return { kind: 'tmux', tmuxBin };
+  if (!stdinIsTTY || !stdoutIsTTY) return { kind: 'unsupported' };
+  return { kind: 'pty-footer' };
+}
+
+async function launchPtyFooterSession({ since, options }) {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error('no-tmux launch mode requires an interactive terminal.');
+  }
+  ensureNodePtySpawnHelperExecutable();
+
+  const footerOptions = {
+    ...options,
+    refreshPrices: false,
+    json: false,
+    status: true,
+  };
+  if (options.refreshPrices) {
+    await refreshPrices({ priceUrl: options.priceUrl, pricePath: options.pricePath });
+  }
+
+  const initialSize = currentPtyFooterSize();
+  const child = pty.spawn(resolveCodexCommand(), options.codexArgs, {
+    name: process.env.TERM || 'xterm-256color',
+    cols: initialSize.cols,
+    rows: initialSize.childRows,
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      COLUMNS: String(initialSize.cols),
+      LINES: String(initialSize.childRows),
+      CODEX_METER_PTY_FOOTER: '1',
+    },
+  });
+
+  let stopped = false;
+  let footerLine = 'codex-meter starting...';
+  let refreshRunning = false;
+  let redrawTimer = null;
+  let refreshInterval = null;
+  const previousRawMode = process.stdin.isRaw;
+
+  const restoreTerminal = () => {
+    if (restoreTerminal.done) return;
+    restoreTerminal.done = true;
+    stopped = true;
+    if (redrawTimer) clearTimeout(redrawTimer);
+    if (refreshInterval) clearInterval(refreshInterval);
+    process.stdout.off('resize', onResize);
+    process.stdin.off('data', onInput);
+    process.off('SIGINT', onSignal);
+    process.off('SIGTERM', onSignal);
+    if (process.stdin.isTTY) {
+      process.stdin.setRawMode(previousRawMode);
+      process.stdin.pause();
+    }
+    process.stdout.write('\x1b[r\x1b[0m\x1b[?25h');
+    clearFooterRow();
+  };
+  restoreTerminal.done = false;
+
+  const drawCurrentFooter = () => {
+    if (!stopped) drawFooterLine(footerLine);
+  };
+  const scheduleRedraw = () => {
+    if (stopped || redrawTimer) return;
+    redrawTimer = setTimeout(() => {
+      redrawTimer = null;
+      drawCurrentFooter();
+    }, 25);
+  };
+  const refreshFooter = async () => {
+    if (stopped || refreshRunning) return;
+    refreshRunning = true;
+    try {
+      const summary = await calculate({ since, options: footerOptions });
+      footerLine = formatCompact(summary);
+    } catch (error) {
+      footerLine = `codex-meter error: ${error.message}`;
+    } finally {
+      refreshRunning = false;
+      drawCurrentFooter();
+    }
+  };
+  const onInput = (data) => {
+    child.write(data);
+  };
+  const onResize = () => {
+    const size = currentPtyFooterSize();
+    child.resize(size.cols, size.childRows);
+    reserveFooterRow();
+    drawCurrentFooter();
+  };
+  const onSignal = (signal) => {
+    child.kill(signal);
+  };
+
+  reserveFooterRow();
+  if (process.stdin.isTTY) {
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+  }
+  process.stdin.on('data', onInput);
+  process.stdout.on('resize', onResize);
+  process.on('SIGINT', onSignal);
+  process.on('SIGTERM', onSignal);
+  process.on('exit', restoreTerminal);
+
+  child.onData((data) => {
+    process.stdout.write(data);
+    scheduleRedraw();
+  });
+
+  const exitPromise = new Promise((resolveExit) => {
+    child.onExit(({ exitCode, signal }) => {
+      restoreTerminal();
+      process.off('exit', restoreTerminal);
+      process.exitCode = typeof exitCode === 'number'
+        ? exitCode
+        : exitCodeFromSignal(signal);
+      resolveExit();
+    });
+  });
+
+  refreshInterval = setInterval(refreshFooter, Math.max(1, options.interval) * 1000);
+  await refreshFooter();
+  await exitPromise;
+}
+
+function resolveCodexCommand(env = process.env) {
+  const override = env.CODEX_METER_CODEX_BIN;
+  return typeof override === 'string' && override.trim() ? override.trim() : 'codex';
+}
+
+function ensureNodePtySpawnHelperExecutable() {
+  if (process.platform === 'win32') return;
+  let packageRoot;
+  try {
+    packageRoot = resolve(dirname(require.resolve('node-pty/lib/index.js')), '..');
+  } catch {
+    return;
+  }
+  for (const helperPath of [
+    join(packageRoot, 'build', 'Release', 'spawn-helper'),
+    join(packageRoot, 'build', 'Debug', 'spawn-helper'),
+    join(packageRoot, 'prebuilds', `${process.platform}-${process.arch}`, 'spawn-helper'),
+  ]) {
+    if (!existsSync(helperPath)) continue;
+    const stats = statSync(helperPath);
+    if ((stats.mode & 0o111) !== 0) continue;
+    chmodSync(helperPath, stats.mode | 0o755);
+  }
+}
+
+function currentPtyFooterSize() {
+  const cols = Math.max(20, process.stdout.columns || 80);
+  const rows = Math.max(2, process.stdout.rows || 24);
+  return {
+    cols,
+    rows,
+    childRows: Math.max(1, rows - PTY_FOOTER_HEIGHT),
+    footerRow: rows,
+  };
+}
+
+function reserveFooterRow() {
+  const { childRows } = currentPtyFooterSize();
+  process.stdout.write(`\x1b[1;${childRows}r`);
+}
+
+function drawFooterLine(line) {
+  const { childRows, cols, footerRow } = currentPtyFooterSize();
+  const text = fitTerminalLine(line, cols);
+  process.stdout.write(`\x1b7\x1b[1;${childRows}r\x1b[${footerRow};1H\x1b[7m${text}\x1b[0m\x1b8`);
+}
+
+function clearFooterRow() {
+  const { footerRow } = currentPtyFooterSize();
+  process.stdout.write(`\x1b7\x1b[${footerRow};1H\x1b[2K\x1b8`);
+}
+
+function fitTerminalLine(line, cols) {
+  const normalized = String(line).replace(/[\r\n]+/g, ' ');
+  if (normalized.length >= cols) return normalized.slice(0, cols);
+  return normalized.padEnd(cols, ' ');
+}
+
+function exitCodeFromSignal(signal) {
+  if (typeof signal === 'number') return 128 + signal;
+  const signalNumbers = { SIGINT: 2, SIGTERM: 15, SIGHUP: 1 };
+  return 128 + (signalNumbers[signal] ?? 1);
 }
 
 function assertTmuxAvailable() {
@@ -904,14 +1110,6 @@ function buildCodexLeaderCommand(codexArgs, sessionName, tmuxBin) {
   return `/bin/sh -c ${shellEscape(script)}`;
 }
 
-function runCodexDirect(codexArgs) {
-  const result = spawnSync('codex', codexArgs, { stdio: 'inherit' });
-  if (result.error) {
-    throw new Error(`direct codex launch failed: ${result.error.message}`);
-  }
-  process.exitCode = typeof result.status === 'number' ? result.status : 1;
-}
-
 function shellEscape(value) {
   return `'${String(value).replace(/'/g, "'\\''")}'`;
 }
@@ -966,9 +1164,13 @@ if (isDirectRun()) {
 export {
   aggregateSessions,
   estimateCosts,
+  exitCodeFromSignal,
+  fitTerminalLine,
   formatCompact,
   loadPriceBook,
   parseArgs,
   parseSince,
+  resolveCodexCommand,
+  selectLaunchMode,
   upsertCodexStatusLineText,
 };

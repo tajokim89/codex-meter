@@ -58,8 +58,7 @@ codex-meter setup
 
 This configures Codex's built-in `[tui].status_line` with token and limit items
 similar to OMX setup. Codex owns that footer and only supports built-in item IDs
-there, so the custom since/cost meter is provided by launch mode when a terminal
-multiplexer is available.
+there, so the custom since/cost meter is drawn by `codex-meter launch`.
 
 ## Cost Estimates
 
@@ -98,21 +97,27 @@ For scripts or status bars, use:
 codex-meter since 2026-06-10 --status
 ```
 
-`--status` prints once and exits. For a live bottom-pane display under Codex,
-launch Codex through `codex-meter`:
+`--status` prints once and exits. It does not inject text into Codex's native
+footer. For a live bottom-pane display under Codex, launch Codex through
+`codex-meter`:
 
 ```bash
 codex-meter launch since 2026-06-10
 ```
 
-This matches the OMX launch behavior: when `tmux` or `psmux` is available,
-`codex-meter` creates a managed session, starts Codex in the main pane, and
-starts the live meter in a small bottom pane. You do not need to run `tmux`
-yourself.
+When `tmux` or `psmux` is available, `codex-meter` creates a managed session,
+starts Codex in the main pane, and starts the live meter in a small bottom pane.
+You do not need to run `tmux` yourself.
 
-When no terminal multiplexer is installed, `codex-meter launch` falls back to a
-direct Codex launch. In that mode Codex's built-in `status_line` still works for
-its built-in token/limit items, but the custom live cost pane is unavailable.
+When no terminal multiplexer is installed, `codex-meter launch` uses a PTY
+wrapper instead of falling back to plain `codex`. Codex runs normally in the top
+part of the terminal, and `codex-meter` reserves the last terminal row for a
+continuously updating local-only since/cost meter.
+
+The no-tmux wrapper uses `node-pty` because Codex is a full-screen terminal UI.
+PTY support is what lets `codex-meter` pass input through normally, resize the
+child terminal, preserve Codex's exit code, and draw a separate footer row
+without injecting text into the Codex conversation.
 
 Pass Codex arguments after `--` when needed:
 

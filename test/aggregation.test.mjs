@@ -6,8 +6,12 @@ import { tmpdir } from 'node:os';
 import {
   aggregateSessions,
   estimateCosts,
+  exitCodeFromSignal,
+  fitTerminalLine,
   parseArgs,
   parseSince,
+  resolveCodexCommand,
+  selectLaunchMode,
   upsertCodexStatusLineText,
 } from '../src/cli.mjs';
 
@@ -179,6 +183,34 @@ test('parses managed launch and codex passthrough args', () => {
   assert.equal(parsed.options.launch, true);
   assert.equal(parsed.options.interval, 3);
   assert.deepEqual(parsed.options.codexArgs, ['--model', 'gpt-5']);
+});
+
+test('selects pty footer launch mode when tmux is unavailable in a tty', () => {
+  assert.deepEqual(
+    selectLaunchMode({ tmuxBin: null, stdinIsTTY: true, stdoutIsTTY: true }),
+    { kind: 'pty-footer' },
+  );
+  assert.deepEqual(
+    selectLaunchMode({ tmuxBin: '/opt/homebrew/bin/tmux', stdinIsTTY: true, stdoutIsTTY: true }),
+    { kind: 'tmux', tmuxBin: '/opt/homebrew/bin/tmux' },
+  );
+  assert.deepEqual(
+    selectLaunchMode({ tmuxBin: null, stdinIsTTY: false, stdoutIsTTY: true }),
+    { kind: 'unsupported' },
+  );
+});
+
+test('formats pty footer lines to exactly one terminal row', () => {
+  assert.equal(fitTerminalLine('abc', 5), 'abc  ');
+  assert.equal(fitTerminalLine('abcdef', 5), 'abcde');
+  assert.equal(fitTerminalLine('a\nb\rc', 5), 'a b c');
+  assert.equal(exitCodeFromSignal('SIGINT'), 130);
+});
+
+test('resolves codex command with test override', () => {
+  assert.equal(resolveCodexCommand({}), 'codex');
+  assert.equal(resolveCodexCommand({ CODEX_METER_CODEX_BIN: '/bin/sh' }), '/bin/sh');
+  assert.equal(resolveCodexCommand({ CODEX_METER_CODEX_BIN: '   ' }), 'codex');
 });
 
 test('parses setup command config option', () => {
