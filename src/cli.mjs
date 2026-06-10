@@ -780,8 +780,6 @@ async function launchTmuxPane({ commandArgs, options }) {
 async function launchManagedCodexSession({ commandArgs, options }) {
   const tmuxBin = resolveWorkingTmuxBinary();
   if (!tmuxBin) {
-    process.stderr.write('[codex-meter] tmux/psmux not found; launching Codex directly. Live cost pane is unavailable without a terminal multiplexer.\n');
-    process.stderr.write('[codex-meter] Codex built-in status_line still works for built-in token/limit items configured in ~/.codex/config.toml.\n');
     runCodexDirect(options.codexArgs);
     return;
   }
