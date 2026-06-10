@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 import { readFile, writeFile, mkdir, readdir } from 'node:fs/promises';
-import { createReadStream, existsSync, realpathSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { createReadStream, existsSync, realpathSync, statSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { join, resolve, dirname } from 'node:path';
+import { join, resolve, dirname, delimiter } from 'node:path';
 import { homedir } from 'node:os';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
@@ -13,28 +13,47 @@ const DEFAULT_PRICE_URL =
 
 const DEFAULT_PRICE_CACHE = join(homedir(), '.cache', 'codex-meter', 'prices.litellm.json');
 const DEFAULT_SESSIONS_DIR = join(homedir(), '.codex', 'sessions');
+const DEFAULT_CODEX_CONFIG = join(homedir(), '.codex', 'config.toml');
 const DEFAULT_TMUX_HEIGHT = 2;
 const UNKNOWN_MODEL = 'unknown';
+const DEFAULT_CODEX_STATUS_LINE = [
+  'model-with-reasoning',
+  'git-branch',
+  'context-remaining',
+  'context-used',
+  'used-tokens',
+  'total-input-tokens',
+  'total-output-tokens',
+  'five-hour-limit',
+  'weekly-limit',
+];
 
 function usage() {
   return [
     'Usage:',
+    '  codex-meter setup',
+    '  codex-meter launch since YYYY-MM-DD [-- CODEX_ARGS...]',
+    '  codex-meter launch today [-- CODEX_ARGS...]',
+    '  codex-meter launch week [-- CODEX_ARGS...]',
     '  codex-meter since YYYY-MM-DD [--watch] [--status] [--json]',
     '  codex-meter today [--watch] [--status] [--json]',
     '  codex-meter week [--watch] [--status] [--json]',
     '',
     'Options:',
     '  --sessions-dir PATH     Codex sessions directory (default: ~/.codex/sessions)',
+    '  --config PATH           Codex config path for setup (default: ~/.codex/config.toml)',
     '  --prices PATH           LiteLLM price cache JSON (default: ~/.cache/codex-meter/prices.litellm.json)',
     '  --refresh-prices        Refresh LiteLLM price cache over HTTP, then calculate',
     '  --price-url URL         Override LiteLLM-compatible price JSON URL',
     '  --watch                 Recalculate continuously without model/API calls',
     '  --interval SECONDS      Watch interval (default: 2)',
     '  --status                Print one compact line',
+    '  --launch                Launch Codex with a managed live meter pane',
     '  --tmux                  Open a bottom tmux pane and run live compact status there',
     '  --tmux-height LINES     Bottom tmux pane height (default: 2)',
     '  --json                  Print machine-readable JSON',
     '  --details               Include per-model rows in text output',
+    '  -- CODEX_ARGS...        Extra arguments passed to codex in launch mode',
     '  --help                  Show this help',
   ].join('\n');
 }
@@ -43,21 +62,47 @@ function parseArgs(argv) {
   const args = [...argv];
   const options = {
     sessionsDir: DEFAULT_SESSIONS_DIR,
+    configPath: DEFAULT_CODEX_CONFIG,
     pricePath: DEFAULT_PRICE_CACHE,
     priceUrl: DEFAULT_PRICE_URL,
     refreshPrices: false,
     watch: false,
     interval: 2,
     status: false,
+    launch: false,
     tmux: false,
     tmuxHeight: DEFAULT_TMUX_HEIGHT,
     json: false,
     details: false,
+    codexArgs: [],
   };
 
-  const command = args.shift();
+  let command = args.shift();
   if (!command || command === '--help' || command === '-h') {
     return { help: true, options };
+  }
+  if (command === 'setup') {
+    while (args.length > 0) {
+      const arg = args.shift();
+      switch (arg) {
+        case '--config':
+          options.configPath = requireValue(arg, args);
+          break;
+        case '--help':
+        case '-h':
+          return { help: true, options };
+        default:
+          throw new Error(`unknown option: ${arg}`);
+      }
+    }
+    return { setup: true, options };
+  }
+  if (command === 'launch') {
+    options.launch = true;
+    command = args.shift();
+    if (!command) {
+      throw new Error('launch requires since YYYY-MM-DD, today, or week');
+    }
   }
 
   let sinceArg = null;
@@ -75,6 +120,10 @@ function parseArgs(argv) {
 
   while (args.length > 0) {
     const arg = args.shift();
+    if (arg === '--') {
+      options.codexArgs = args.splice(0);
+      break;
+    }
     switch (arg) {
       case '--sessions-dir':
         options.sessionsDir = requireValue(arg, args);
@@ -99,6 +148,9 @@ function parseArgs(argv) {
         break;
       case '--status':
         options.status = true;
+        break;
+      case '--launch':
+        options.launch = true;
         break;
       case '--tmux':
         options.tmux = true;
@@ -471,6 +523,98 @@ async function refreshPrices({ priceUrl, pricePath }) {
   await writeFile(pricePath, text);
 }
 
+async function setupCodexStatusLine({ configPath }) {
+  let current = '';
+  try {
+    current = await readFile(configPath, 'utf8');
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+
+  const updated = upsertCodexStatusLineText(current);
+  await mkdir(dirname(configPath), { recursive: true });
+  await writeFile(configPath, updated);
+  process.stdout.write(`codex-meter setup updated ${configPath}\n`);
+  process.stdout.write('Codex built-in status_line now includes token and limit items. Custom since/cost meter still requires launch mode with tmux/psmux for a live pane.\n');
+}
+
+function upsertCodexStatusLineText(configText) {
+  const text = configText.endsWith('\n') || configText.length === 0
+    ? configText
+    : `${configText}\n`;
+  const block = findTomlTableBlock(text, 'tui');
+  const statusLine = `status_line = ${formatTomlStringArray(DEFAULT_CODEX_STATUS_LINE)}`;
+
+  if (!block) {
+    return `${text}\n[tui]\n# codex-meter:managed-status-line\n${statusLine}\n`;
+  }
+
+  const before = text.slice(0, block.start);
+  const table = text.slice(block.start, block.end);
+  const after = text.slice(block.end);
+  const lines = table.split('\n');
+  const statusIndex = lines.findIndex((line) => /^\s*status_line\s*=/.test(line));
+  if (statusIndex === -1) {
+    lines.splice(1, 0, '# codex-meter:managed-status-line', statusLine);
+    return `${before}${lines.join('\n')}${after}`;
+  }
+
+  const existingItems = parseTomlStringArrayLine(lines[statusIndex]);
+  const merged = mergeUnique(existingItems, DEFAULT_CODEX_STATUS_LINE);
+  lines[statusIndex] = `status_line = ${formatTomlStringArray(merged)}`;
+  const previousLine = lines[statusIndex - 1] ?? '';
+  if (!previousLine.includes('codex-meter:managed-status-line')) {
+    lines.splice(statusIndex, 0, '# codex-meter:managed-status-line');
+  }
+  return `${before}${lines.join('\n')}${after}`;
+}
+
+function findTomlTableBlock(text, tableName) {
+  const headerPattern = new RegExp(`^\\[${escapeRegExp(tableName)}\\]\\s*$`, 'm');
+  const header = headerPattern.exec(text);
+  if (!header) return null;
+  const start = header.index;
+  const restStart = start + header[0].length;
+  const nextHeader = /^\[[^\]]+\]\s*$/m.exec(text.slice(restStart));
+  const end = nextHeader ? restStart + nextHeader.index : text.length;
+  return { start, end };
+}
+
+function parseTomlStringArrayLine(line) {
+  const items = [];
+  const match = /=\s*\[(.*)\]\s*$/.exec(line);
+  if (!match) return items;
+  const itemPattern = /"((?:\\.|[^"\\])*)"/g;
+  let itemMatch;
+  while ((itemMatch = itemPattern.exec(match[1])) !== null) {
+    try {
+      items.push(JSON.parse(`"${itemMatch[1]}"`));
+    } catch {
+      // Ignore malformed string entries and keep the managed defaults.
+    }
+  }
+  return items;
+}
+
+function formatTomlStringArray(items) {
+  return `[${items.map((item) => JSON.stringify(item)).join(', ')}]`;
+}
+
+function mergeUnique(primary, defaults) {
+  const seen = new Set();
+  const merged = [];
+  for (const item of [...primary, ...defaults]) {
+    if (typeof item !== 'string' || seen.has(item)) continue;
+    seen.add(item);
+    merged.push(item);
+  }
+  return merged;
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 function formatCompact(summary) {
   const cached = summary.total.cachedInputTokens;
   const uncached = Math.max(summary.total.inputTokens - cached, 0);
@@ -560,15 +704,7 @@ async function watch({ since, options }) {
   }
 }
 
-async function launchTmuxPane({ commandArgs, options }) {
-  if (!process.env.TMUX) {
-    throw new Error('--tmux requires a tmux session. Start tmux, run codex-meter since YYYY-MM-DD --tmux, then run codex in the main pane.');
-  }
-
-  if (options.refreshPrices) {
-    await refreshPrices({ priceUrl: options.priceUrl, pricePath: options.pricePath });
-  }
-
+function buildMeterChildArgs(commandArgs, options) {
   const childArgs = [
     ...commandArgs,
     '--watch',
@@ -582,15 +718,32 @@ async function launchTmuxPane({ commandArgs, options }) {
   if (options.pricePath !== DEFAULT_PRICE_CACHE) {
     childArgs.push('--prices', options.pricePath);
   }
+  return childArgs;
+}
 
+function buildMeterWatchCommand(commandArgs, options) {
   const modulePath = fileURLToPath(import.meta.url);
-  const childCommand = [
+  const command = [
     'env',
     'CODEX_METER_TMUX=1',
     process.execPath,
     modulePath,
-    ...childArgs,
+    ...buildMeterChildArgs(commandArgs, options),
   ].map(shellEscape).join(' ');
+  return `exec ${command}`;
+}
+
+async function launchTmuxPane({ commandArgs, options }) {
+  if (!process.env.TMUX) {
+    throw new Error('--tmux requires a tmux session. Start tmux, run codex-meter since YYYY-MM-DD --tmux, then run codex in the main pane.');
+  }
+  const tmuxBin = assertTmuxAvailable();
+
+  if (options.refreshPrices) {
+    await refreshPrices({ priceUrl: options.priceUrl, pricePath: options.pricePath });
+  }
+
+  const childCommand = buildMeterWatchCommand(commandArgs, options);
 
   const tmuxArgs = [
     'split-window',
@@ -609,12 +762,12 @@ async function launchTmuxPane({ commandArgs, options }) {
   }
   tmuxArgs.push(childCommand);
 
-  const paneId = execFileSync('tmux', tmuxArgs, { encoding: 'utf8' }).trim();
+  const paneId = execFileSync(tmuxBin, tmuxArgs, { encoding: 'utf8' }).trim();
   if (paneId) {
     try {
-      execFileSync('tmux', ['select-pane', '-t', paneId, '-T', 'codex-meter']);
+      execFileSync(tmuxBin, ['select-pane', '-t', paneId, '-T', 'codex-meter']);
       if (process.env.TMUX_PANE) {
-        execFileSync('tmux', ['select-pane', '-t', process.env.TMUX_PANE]);
+        execFileSync(tmuxBin, ['select-pane', '-t', process.env.TMUX_PANE]);
       }
     } catch {
       // Pane title/focus is cosmetic; the meter pane has already launched.
@@ -622,6 +775,143 @@ async function launchTmuxPane({ commandArgs, options }) {
   }
 
   process.stdout.write(`codex-meter live pane launched below (${options.tmuxHeight} lines).\n`);
+}
+
+async function launchManagedCodexSession({ commandArgs, options }) {
+  const tmuxBin = resolveWorkingTmuxBinary();
+  if (!tmuxBin) {
+    process.stderr.write('[codex-meter] tmux/psmux not found; launching Codex directly. Live cost pane is unavailable without a terminal multiplexer.\n');
+    process.stderr.write('[codex-meter] Codex built-in status_line still works for built-in token/limit items configured in ~/.codex/config.toml.\n');
+    runCodexDirect(options.codexArgs);
+    return;
+  }
+
+  if (options.refreshPrices) {
+    await refreshPrices({ priceUrl: options.priceUrl, pricePath: options.pricePath });
+  }
+
+  const sessionName = buildManagedSessionName();
+  const meterCommand = buildMeterWatchCommand(commandArgs, options);
+  const codexCommand = buildCodexLeaderCommand(options.codexArgs, sessionName, tmuxBin);
+  let createdSession = false;
+
+  try {
+    execFileSync(tmuxBin, [
+      'new-session',
+      '-d',
+      '-s',
+      sessionName,
+      '-c',
+      process.cwd(),
+      codexCommand,
+    ]);
+    createdSession = true;
+    execFileSync(tmuxBin, [
+      'split-window',
+      '-v',
+      '-l',
+      String(options.tmuxHeight),
+      '-d',
+      '-t',
+      sessionName,
+      '-c',
+      process.cwd(),
+      meterCommand,
+    ]);
+    const attachArgs = process.env.TMUX
+      ? ['switch-client', '-t', sessionName]
+      : ['attach-session', '-t', sessionName];
+    execFileSync(tmuxBin, attachArgs, { stdio: 'inherit' });
+  } catch (error) {
+    if (createdSession) {
+      try {
+        execFileSync(tmuxBin, ['kill-session', '-t', sessionName], { stdio: 'ignore' });
+      } catch {
+        // Best effort cleanup after launch failure.
+      }
+    }
+    throw new Error(`managed launch failed: ${error.message}`);
+  }
+}
+
+function assertTmuxAvailable() {
+  const tmuxBin = resolveWorkingTmuxBinary();
+  if (!tmuxBin) {
+    throw new Error('this mode requires a working tmux or psmux binary on PATH.');
+  }
+  return tmuxBin;
+}
+
+function resolveWorkingTmuxBinary() {
+  const tmuxBin = resolveTmuxBinary();
+  if (!tmuxBin) {
+    return null;
+  }
+  try {
+    execFileSync(tmuxBin, ['-V'], { stdio: 'ignore' });
+  } catch {
+    return null;
+  }
+  return tmuxBin;
+}
+
+function resolveTmuxBinary() {
+  const candidates = process.platform === 'win32'
+    ? ['tmux.exe', 'tmux', 'psmux.exe', 'psmux']
+    : ['tmux', 'psmux'];
+  for (const command of candidates) {
+    const resolved = resolveCommandPath(command);
+    if (resolved) return resolved;
+  }
+  return null;
+}
+
+function resolveCommandPath(command) {
+  const pathEntries = String(process.env.PATH ?? process.env.Path ?? '')
+    .split(delimiter)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  for (const entry of pathEntries) {
+    const candidate = resolve(entry, command);
+    if (isFile(candidate)) return candidate;
+  }
+  return null;
+}
+
+function isFile(path) {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function buildManagedSessionName() {
+  return `codex-meter-${process.pid}-${Date.now().toString(36)}`;
+}
+
+function buildCodexLeaderCommand(codexArgs, sessionName, tmuxBin) {
+  const codexCommand = ['codex', ...codexArgs].map(shellEscape).join(' ');
+  const closeSessionCommand = `${shellEscape(tmuxBin)} kill-session -t ${shellEscape(sessionName)} >/dev/null 2>&1 || true`;
+  const script = [
+    codexCommand,
+    'status=$?',
+    'if [ "$status" -ne 0 ]; then',
+    '  printf "\\n[codex-meter] codex exited with code %s. Press Enter to close this session.\\n" "$status" >&2',
+    '  IFS= read -r _codex_meter_close || true',
+    'fi',
+    closeSessionCommand,
+    'exit "$status"',
+  ].join('\n');
+  return `/bin/sh -c ${shellEscape(script)}`;
+}
+
+function runCodexDirect(codexArgs) {
+  const result = spawnSync('codex', codexArgs, { stdio: 'inherit' });
+  if (result.error) {
+    throw new Error(`direct codex launch failed: ${result.error.message}`);
+  }
+  process.exitCode = typeof result.status === 'number' ? result.status : 1;
 }
 
 function shellEscape(value) {
@@ -643,7 +933,11 @@ async function main() {
   }
 
   try {
-    if (parsed.options.tmux) {
+    if (parsed.setup) {
+      await setupCodexStatusLine(parsed.options);
+    } else if (parsed.options.launch) {
+      await launchManagedCodexSession(parsed);
+    } else if (parsed.options.tmux) {
       await launchTmuxPane(parsed);
     } else if (parsed.options.watch) {
       await watch(parsed);
@@ -678,4 +972,5 @@ export {
   loadPriceBook,
   parseArgs,
   parseSince,
+  upsertCodexStatusLineText,
 };

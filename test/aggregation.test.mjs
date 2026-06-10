@@ -3,7 +3,13 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { aggregateSessions, estimateCosts, parseArgs, parseSince } from '../src/cli.mjs';
+import {
+  aggregateSessions,
+  estimateCosts,
+  parseArgs,
+  parseSince,
+  upsertCodexStatusLineText,
+} from '../src/cli.mjs';
 
 test('aggregates token_count deltas by model and skips duplicate totals', async () => {
   const root = await mkdtemp(join(tmpdir(), 'codex-meter-'));
@@ -155,4 +161,46 @@ test('parses tmux bottom pane options', () => {
   assert.equal(parsed.options.tmux, true);
   assert.equal(parsed.options.tmuxHeight, 3);
   assert.equal(parsed.options.interval, 5);
+});
+
+test('parses managed launch and codex passthrough args', () => {
+  const parsed = parseArgs([
+    'launch',
+    'since',
+    '2026-06-10',
+    '--interval',
+    '3',
+    '--',
+    '--model',
+    'gpt-5',
+  ]);
+
+  assert.deepEqual(parsed.commandArgs, ['since', '2026-06-10']);
+  assert.equal(parsed.options.launch, true);
+  assert.equal(parsed.options.interval, 3);
+  assert.deepEqual(parsed.options.codexArgs, ['--model', 'gpt-5']);
+});
+
+test('parses setup command config option', () => {
+  const parsed = parseArgs(['setup', '--config', '/tmp/codex-config.toml']);
+
+  assert.equal(parsed.setup, true);
+  assert.equal(parsed.options.configPath, '/tmp/codex-config.toml');
+});
+
+test('setup merges codex status line into existing tui table', () => {
+  const updated = upsertCodexStatusLineText([
+    'model = "gpt-5"',
+    '',
+    '[tui]',
+    'theme = "night"',
+    'status_line = ["git-branch"]',
+    '',
+    '[features]',
+    'hooks = true',
+    '',
+  ].join('\n'));
+
+  assert.match(updated, /\[tui\]\ntheme = "night"\n# codex-meter:managed-status-line\nstatus_line = \["git-branch", "model-with-reasoning"/);
+  assert.match(updated, /\[features\]\nhooks = true/);
 });

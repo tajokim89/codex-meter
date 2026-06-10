@@ -17,6 +17,8 @@ npm install -g codex-meter
 Run:
 
 ```bash
+codex-meter setup
+codex-meter launch since 2026-06-10
 codex-meter since 2026-06-10
 codex-meter since 2026-06-10 --status
 codex-meter since 2026-06-10 --watch --status
@@ -45,6 +47,19 @@ Compact output:
 ```text
 since 2026-06-10 | tokens 639.4k | cached 564.2k | uncached 68.3k | est $0.4200
 ```
+
+## Codex Setup
+
+Run setup once after installing:
+
+```bash
+codex-meter setup
+```
+
+This configures Codex's built-in `[tui].status_line` with token and limit items
+similar to OMX setup. Codex owns that footer and only supports built-in item IDs
+there, so the custom since/cost meter is provided by launch mode when a terminal
+multiplexer is available.
 
 ## Cost Estimates
 
@@ -84,17 +99,33 @@ codex-meter since 2026-06-10 --status
 ```
 
 `--status` prints once and exits. For a live bottom-pane display under Codex,
-run inside tmux:
+launch Codex through `codex-meter`:
 
 ```bash
-tmux
-codex-meter since 2026-06-10 --tmux
-codex
+codex-meter launch since 2026-06-10
 ```
 
-This matches the OMX HUD approach: the live meter is a small tmux split pane,
-not a custom Codex native footer item. It keeps updating by reading local
-session logs and does not make model/API calls.
+This matches the OMX launch behavior: when `tmux` or `psmux` is available,
+`codex-meter` creates a managed session, starts Codex in the main pane, and
+starts the live meter in a small bottom pane. You do not need to run `tmux`
+yourself.
+
+When no terminal multiplexer is installed, `codex-meter launch` falls back to a
+direct Codex launch. In that mode Codex's built-in `status_line` still works for
+its built-in token/limit items, but the custom live cost pane is unavailable.
+
+Pass Codex arguments after `--` when needed:
+
+```bash
+codex-meter launch since 2026-06-10 -- --model gpt-5
+```
+
+If you are already inside a tmux session and only want to add the bottom pane,
+use:
+
+```bash
+codex-meter since 2026-06-10 --tmux
+```
 
 For a live inline display in the current terminal, use:
 
