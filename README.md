@@ -20,6 +20,7 @@ Run:
 codex-meter since 2026-06-10
 codex-meter since 2026-06-10 --status
 codex-meter since 2026-06-10 --watch --status
+codex-meter since 2026-06-10 --tmux
 codex-meter today
 codex-meter week
 ```
@@ -82,7 +83,20 @@ For scripts or status bars, use:
 codex-meter since 2026-06-10 --status
 ```
 
-For a live bottom-pane style display, use:
+`--status` prints once and exits. For a live bottom-pane display under Codex,
+run inside tmux:
+
+```bash
+tmux
+codex-meter since 2026-06-10 --tmux
+codex
+```
+
+This matches the OMX HUD approach: the live meter is a small tmux split pane,
+not a custom Codex native footer item. It keeps updating by reading local
+session logs and does not make model/API calls.
+
+For a live inline display in the current terminal, use:
 
 ```bash
 codex-meter since 2026-06-10 --watch --status

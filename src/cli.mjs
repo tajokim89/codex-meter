@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { readFile, writeFile, mkdir, readdir } from 'node:fs/promises';
 import { createReadStream, existsSync, realpathSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { join, resolve, dirname } from 'node:path';
 import { homedir } from 'node:os';
@@ -12,6 +13,7 @@ const DEFAULT_PRICE_URL =
 
 const DEFAULT_PRICE_CACHE = join(homedir(), '.cache', 'codex-meter', 'prices.litellm.json');
 const DEFAULT_SESSIONS_DIR = join(homedir(), '.codex', 'sessions');
+const DEFAULT_TMUX_HEIGHT = 2;
 const UNKNOWN_MODEL = 'unknown';
 
 function usage() {
@@ -29,6 +31,8 @@ function usage() {
     '  --watch                 Recalculate continuously without model/API calls',
     '  --interval SECONDS      Watch interval (default: 2)',
     '  --status                Print one compact line',
+    '  --tmux                  Open a bottom tmux pane and run live compact status there',
+    '  --tmux-height LINES     Bottom tmux pane height (default: 2)',
     '  --json                  Print machine-readable JSON',
     '  --details               Include per-model rows in text output',
     '  --help                  Show this help',
@@ -45,6 +49,8 @@ function parseArgs(argv) {
     watch: false,
     interval: 2,
     status: false,
+    tmux: false,
+    tmuxHeight: DEFAULT_TMUX_HEIGHT,
     json: false,
     details: false,
   };
@@ -65,6 +71,7 @@ function parseArgs(argv) {
   } else {
     throw new Error(`unknown command: ${command}`);
   }
+  const commandArgs = command === 'since' ? ['since', sinceArg] : [command];
 
   while (args.length > 0) {
     const arg = args.shift();
@@ -93,6 +100,15 @@ function parseArgs(argv) {
       case '--status':
         options.status = true;
         break;
+      case '--tmux':
+        options.tmux = true;
+        break;
+      case '--tmux-height':
+        options.tmuxHeight = Number(requireValue(arg, args));
+        if (!Number.isInteger(options.tmuxHeight) || options.tmuxHeight <= 0) {
+          throw new Error('--tmux-height must be a positive integer');
+        }
+        break;
       case '--json':
         options.json = true;
         break;
@@ -107,7 +123,7 @@ function parseArgs(argv) {
     }
   }
 
-  return { since: parseSince(sinceArg), options };
+  return { since: parseSince(sinceArg), options, commandArgs };
 }
 
 function requireValue(flag, args) {
@@ -544,6 +560,74 @@ async function watch({ since, options }) {
   }
 }
 
+async function launchTmuxPane({ commandArgs, options }) {
+  if (!process.env.TMUX) {
+    throw new Error('--tmux requires a tmux session. Start tmux, run codex-meter since YYYY-MM-DD --tmux, then run codex in the main pane.');
+  }
+
+  if (options.refreshPrices) {
+    await refreshPrices({ priceUrl: options.priceUrl, pricePath: options.pricePath });
+  }
+
+  const childArgs = [
+    ...commandArgs,
+    '--watch',
+    '--status',
+    '--interval',
+    String(options.interval),
+  ];
+  if (options.sessionsDir !== DEFAULT_SESSIONS_DIR) {
+    childArgs.push('--sessions-dir', options.sessionsDir);
+  }
+  if (options.pricePath !== DEFAULT_PRICE_CACHE) {
+    childArgs.push('--prices', options.pricePath);
+  }
+
+  const modulePath = fileURLToPath(import.meta.url);
+  const childCommand = [
+    'env',
+    'CODEX_METER_TMUX=1',
+    process.execPath,
+    modulePath,
+    ...childArgs,
+  ].map(shellEscape).join(' ');
+
+  const tmuxArgs = [
+    'split-window',
+    '-v',
+    '-l',
+    String(options.tmuxHeight),
+    '-c',
+    process.cwd(),
+    '-d',
+    '-P',
+    '-F',
+    '#{pane_id}',
+  ];
+  if (process.env.TMUX_PANE) {
+    tmuxArgs.push('-t', process.env.TMUX_PANE);
+  }
+  tmuxArgs.push(childCommand);
+
+  const paneId = execFileSync('tmux', tmuxArgs, { encoding: 'utf8' }).trim();
+  if (paneId) {
+    try {
+      execFileSync('tmux', ['select-pane', '-t', paneId, '-T', 'codex-meter']);
+      if (process.env.TMUX_PANE) {
+        execFileSync('tmux', ['select-pane', '-t', process.env.TMUX_PANE]);
+      }
+    } catch {
+      // Pane title/focus is cosmetic; the meter pane has already launched.
+    }
+  }
+
+  process.stdout.write(`codex-meter live pane launched below (${options.tmuxHeight} lines).\n`);
+}
+
+function shellEscape(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
 async function main() {
   let parsed;
   try {
@@ -559,7 +643,9 @@ async function main() {
   }
 
   try {
-    if (parsed.options.watch) {
+    if (parsed.options.tmux) {
+      await launchTmuxPane(parsed);
+    } else if (parsed.options.watch) {
       await watch(parsed);
     } else {
       const summary = await calculate(parsed);

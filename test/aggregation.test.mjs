@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { aggregateSessions, estimateCosts, parseSince } from '../src/cli.mjs';
+import { aggregateSessions, estimateCosts, parseArgs, parseSince } from '../src/cli.mjs';
 
 test('aggregates token_count deltas by model and skips duplicate totals', async () => {
   const root = await mkdtemp(join(tmpdir(), 'codex-meter-'));
@@ -138,4 +138,21 @@ test('estimates costs for every priced model and marks missing prices partial', 
   assert.equal(estimated.byModel[1].priceMissing, true);
   assert.equal(estimated.cost.partial, true);
   assert.equal(estimated.cost.unpricedTokens, 240);
+});
+
+test('parses tmux bottom pane options', () => {
+  const parsed = parseArgs([
+    'since',
+    '2026-06-10',
+    '--tmux',
+    '--tmux-height',
+    '3',
+    '--interval',
+    '5',
+  ]);
+
+  assert.deepEqual(parsed.commandArgs, ['since', '2026-06-10']);
+  assert.equal(parsed.options.tmux, true);
+  assert.equal(parsed.options.tmuxHeight, 3);
+  assert.equal(parsed.options.interval, 5);
 });
