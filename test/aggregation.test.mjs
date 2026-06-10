@@ -12,6 +12,8 @@ import {
   parseSince,
   resolveCodexCommand,
   selectLaunchMode,
+  removeManagedShellIntegrationText,
+  upsertShellIntegrationText,
   upsertCodexStatusLineText,
 } from '../src/cli.mjs';
 
@@ -218,6 +220,38 @@ test('parses setup command config option', () => {
 
   assert.equal(parsed.setup, true);
   assert.equal(parsed.options.configPath, '/tmp/codex-config.toml');
+});
+
+test('parses setup shell wrapper options', () => {
+  const parsed = parseArgs([
+    'setup',
+    '--shell-file',
+    '/tmp/.zshrc',
+    '--shell',
+    'since',
+    '2026-06-10',
+  ]);
+
+  assert.equal(parsed.setup, true);
+  assert.equal(parsed.options.shellIntegration, true);
+  assert.equal(parsed.options.shellFile, '/tmp/.zshrc');
+  assert.deepEqual(parsed.options.shellCommandArgs, ['since', '2026-06-10']);
+
+  const removeParsed = parseArgs(['setup', '--remove-shell']);
+  assert.equal(removeParsed.options.removeShellIntegration, true);
+});
+
+test('upserts and removes managed shell wrapper block', () => {
+  const first = upsertShellIntegrationText('export EDITOR=vim\n', ['since', '2026-06-10']);
+  assert.match(first, /codex\(\) \{\n  command codex-meter launch 'since' '2026-06-10' -- "\$@"/);
+
+  const second = upsertShellIntegrationText(first, ['today']);
+  assert.equal((second.match(/codex-meter codex wrapper/g) ?? []).length, 2);
+  assert.doesNotMatch(second, /2026-06-10/);
+  assert.match(second, /command codex-meter launch 'today' -- "\$@"/);
+
+  const removed = removeManagedShellIntegrationText(second);
+  assert.equal(removed, 'export EDITOR=vim\n');
 });
 
 test('setup merges codex status line into existing tui table', () => {

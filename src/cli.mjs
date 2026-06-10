@@ -3,7 +3,7 @@ import { readFile, writeFile, mkdir, readdir } from 'node:fs/promises';
 import { chmodSync, createReadStream, existsSync, realpathSync, statSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { join, resolve, dirname, delimiter } from 'node:path';
+import { join, resolve, dirname, delimiter, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
@@ -17,9 +17,12 @@ const require = createRequire(import.meta.url);
 const DEFAULT_PRICE_CACHE = join(homedir(), '.cache', 'codex-meter', 'prices.litellm.json');
 const DEFAULT_SESSIONS_DIR = join(homedir(), '.codex', 'sessions');
 const DEFAULT_CODEX_CONFIG = join(homedir(), '.codex', 'config.toml');
+const DEFAULT_SHELL_RC = defaultShellRcPath();
 const DEFAULT_TMUX_HEIGHT = 2;
 const PTY_FOOTER_HEIGHT = 1;
 const UNKNOWN_MODEL = 'unknown';
+const SHELL_BLOCK_START = '# >>> codex-meter codex wrapper >>>';
+const SHELL_BLOCK_END = '# <<< codex-meter codex wrapper <<<';
 const DEFAULT_CODEX_STATUS_LINE = [
   'model-with-reasoning',
   'git-branch',
@@ -35,7 +38,8 @@ const DEFAULT_CODEX_STATUS_LINE = [
 function usage() {
   return [
     'Usage:',
-    '  codex-meter setup',
+    '  codex-meter setup [--shell since YYYY-MM-DD|today|week]',
+    '  codex-meter setup --remove-shell',
     '  codex-meter launch since YYYY-MM-DD [-- CODEX_ARGS...]',
     '  codex-meter launch today [-- CODEX_ARGS...]',
     '  codex-meter launch week [-- CODEX_ARGS...]',
@@ -57,6 +61,9 @@ function usage() {
     '  --tmux-height LINES     Bottom tmux pane height (default: 2)',
     '  --json                  Print machine-readable JSON',
     '  --details               Include per-model rows in text output',
+    '  --shell since DATE      Make `codex` run through codex-meter launch',
+    '  --shell-file PATH       Shell rc file for --shell (default: detected shell rc)',
+    '  --remove-shell          Remove the managed codex shell wrapper',
     '  -- CODEX_ARGS...        Extra arguments passed to codex in launch mode',
     '  --help                  Show this help',
   ].join('\n');
@@ -79,6 +86,10 @@ function parseArgs(argv) {
     json: false,
     details: false,
     codexArgs: [],
+    shellIntegration: false,
+    removeShellIntegration: false,
+    shellFile: DEFAULT_SHELL_RC,
+    shellCommandArgs: null,
   };
 
   let command = args.shift();
@@ -92,12 +103,25 @@ function parseArgs(argv) {
         case '--config':
           options.configPath = requireValue(arg, args);
           break;
+        case '--shell':
+          options.shellIntegration = true;
+          options.shellCommandArgs = parseSetupShellCommand(args);
+          break;
+        case '--shell-file':
+          options.shellFile = requireValue(arg, args);
+          break;
+        case '--remove-shell':
+          options.removeShellIntegration = true;
+          break;
         case '--help':
         case '-h':
           return { help: true, options };
         default:
           throw new Error(`unknown option: ${arg}`);
       }
+    }
+    if (options.shellIntegration && options.removeShellIntegration) {
+      throw new Error('--shell and --remove-shell cannot be used together');
     }
     return { setup: true, options };
   }
@@ -180,6 +204,20 @@ function parseArgs(argv) {
   }
 
   return { since: parseSince(sinceArg), options, commandArgs };
+}
+
+function parseSetupShellCommand(args) {
+  const command = requireValue('--shell', args);
+  if (command === 'since') {
+    const sinceArg = requireValue('since', args);
+    parseSince(sinceArg);
+    return ['since', sinceArg];
+  }
+  if (command === 'today' || command === 'week') {
+    parseSince(command);
+    return [command];
+  }
+  throw new Error('--shell requires since YYYY-MM-DD, today, or week');
 }
 
 function requireValue(flag, args) {
@@ -540,6 +578,88 @@ async function setupCodexStatusLine({ configPath }) {
   await writeFile(configPath, updated);
   process.stdout.write(`codex-meter setup updated ${configPath}\n`);
   process.stdout.write('Codex built-in status_line now includes token and limit items. Use `codex-meter launch ...` for the custom since/cost live meter.\n');
+}
+
+async function setupCodex({ options }) {
+  await setupCodexStatusLine(options);
+  if (options.removeShellIntegration) {
+    await removeCodexShellIntegration({ shellFile: options.shellFile });
+  } else if (options.shellIntegration) {
+    await setupCodexShellIntegration({
+      shellFile: options.shellFile,
+      commandArgs: options.shellCommandArgs,
+    });
+  }
+}
+
+async function setupCodexShellIntegration({ shellFile, commandArgs }) {
+  let current = '';
+  try {
+    current = await readFile(shellFile, 'utf8');
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+
+  const updated = upsertShellIntegrationText(current, commandArgs);
+  await mkdir(dirname(shellFile), { recursive: true });
+  await writeFile(shellFile, updated);
+  process.stdout.write(`codex-meter shell wrapper updated ${shellFile}\n`);
+  process.stdout.write(`New shells will run \`codex\` as \`codex-meter launch ${commandArgs.join(' ')} -- "$@"\`.\n`);
+}
+
+async function removeCodexShellIntegration({ shellFile }) {
+  let current = '';
+  try {
+    current = await readFile(shellFile, 'utf8');
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      process.stdout.write(`codex-meter shell wrapper not found in ${shellFile}\n`);
+      return;
+    }
+    throw error;
+  }
+
+  const updated = removeManagedShellIntegrationText(current);
+  await writeFile(shellFile, updated);
+  process.stdout.write(`codex-meter shell wrapper removed from ${shellFile}\n`);
+}
+
+function defaultShellRcPath(env = process.env) {
+  const shell = basename(env.SHELL ?? '');
+  if (shell === 'bash') return join(homedir(), '.bashrc');
+  if (shell === 'zsh') return join(homedir(), '.zshrc');
+  return join(homedir(), '.profile');
+}
+
+function upsertShellIntegrationText(configText, commandArgs) {
+  const text = removeManagedShellIntegrationText(configText);
+  const prefix = text.length === 0 || text.endsWith('\n') ? text : `${text}\n`;
+  return `${prefix}\n${buildShellIntegrationBlock(commandArgs)}`;
+}
+
+function removeManagedShellIntegrationText(configText) {
+  const start = configText.indexOf(SHELL_BLOCK_START);
+  if (start === -1) return configText;
+  const end = configText.indexOf(SHELL_BLOCK_END, start);
+  if (end === -1) return configText;
+  const afterEnd = end + SHELL_BLOCK_END.length;
+  const afterNewline = configText[afterEnd] === '\n' ? afterEnd + 1 : afterEnd;
+  const before = configText.slice(0, start).replace(/\n{2,}$/, '\n');
+  const after = configText.slice(afterNewline).replace(/^\n{2,}/, '\n');
+  return `${before}${after}`;
+}
+
+function buildShellIntegrationBlock(commandArgs) {
+  const launchArgs = commandArgs.map(shellEscape).join(' ');
+  return [
+    SHELL_BLOCK_START,
+    '# Managed by codex-meter. Remove with: codex-meter setup --remove-shell',
+    'codex() {',
+    `  command codex-meter launch ${launchArgs} -- "$@"`,
+    '}',
+    SHELL_BLOCK_END,
+    '',
+  ].join('\n');
 }
 
 function upsertCodexStatusLineText(configText) {
@@ -1130,7 +1250,7 @@ async function main() {
 
   try {
     if (parsed.setup) {
-      await setupCodexStatusLine(parsed.options);
+      await setupCodex(parsed);
     } else if (parsed.options.launch) {
       await launchManagedCodexSession(parsed);
     } else if (parsed.options.tmux) {
@@ -1172,5 +1292,7 @@ export {
   parseSince,
   resolveCodexCommand,
   selectLaunchMode,
+  upsertShellIntegrationText,
+  removeManagedShellIntegrationText,
   upsertCodexStatusLineText,
 };
