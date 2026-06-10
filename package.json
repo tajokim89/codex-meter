@@ -1,0 +1,42 @@
+{
+  "name": "codex-meter",
+  "version": "0.1.0",
+  "description": "Local, zero-token Codex usage monitor with cached cost estimates.",
+  "type": "module",
+  "packageManager": "npm",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tajokim89/codex-meter.git"
+  },
+  "bugs": {
+    "url": "https://github.com/tajokim89/codex-meter/issues"
+  },
+  "homepage": "https://github.com/tajokim89/codex-meter#readme",
+  "bin": {
+    "codex-meter": "./src/cli.mjs"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "codex",
+    "openai",
+    "tokens",
+    "usage",
+    "litellm",
+    "cli"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "test": "node --test",
+    "prepublishOnly": "npm test"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
