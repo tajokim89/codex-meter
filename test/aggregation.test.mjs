@@ -5,17 +5,37 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   aggregateSessions,
+  applyBudgetStatus,
+  csvEscape,
   estimateCosts,
   exitCodeFromSignal,
   fitTerminalLine,
+  formatCompact,
+  formatCsv,
+  isValidMarkerName,
+  loadBudgetConfig,
+  loadMarkers,
   parseArgs,
   parseSince,
   resolveCodexCommand,
+  saveBudgetConfig,
+  saveMarkers,
   selectLaunchMode,
   removeManagedShellIntegrationText,
   upsertShellIntegrationText,
   upsertCodexStatusLineText,
 } from '../src/cli.mjs';
+
+function emptyTestUsage() {
+  return {
+    inputTokens: 0,
+    cachedInputTokens: 0,
+    outputTokens: 0,
+    reasoningOutputTokens: 0,
+    totalTokens: 0,
+    events: 0,
+  };
+}
 
 test('aggregates token_count deltas by model and skips duplicate totals', async () => {
   const root = await mkdtemp(join(tmpdir(), 'codex-meter-'));
@@ -152,6 +172,98 @@ test('estimates costs for every priced model and marks missing prices partial', 
   assert.equal(estimated.cost.unpricedTokens, 240);
 });
 
+test('aggregates and estimates usage by project', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'codex-meter-projects-'));
+  const sessions = join(root, 'sessions', '2026', '06', '10');
+  await mkdir(sessions, { recursive: true });
+  const file = join(sessions, 'rollout.jsonl');
+  await writeFile(file, [
+    JSON.stringify({
+      timestamp: '2026-06-10T00:00:00.000Z',
+      type: 'session_meta',
+      payload: {
+        cwd: '/tmp/alpha',
+        model: 'gpt-a',
+        git: { repository_url: 'https://github.com/acme/alpha.git' },
+      },
+    }),
+    JSON.stringify({
+      timestamp: '2026-06-10T00:01:00.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: {
+          total_token_usage: {
+            input_tokens: 100,
+            cached_input_tokens: 40,
+            output_tokens: 10,
+            reasoning_output_tokens: 2,
+            total_tokens: 110,
+          },
+        },
+      },
+    }),
+    JSON.stringify({
+      timestamp: '2026-06-10T00:02:00.000Z',
+      type: 'turn_context',
+      payload: { model: 'gpt-b', cwd: '/tmp/beta' },
+    }),
+    JSON.stringify({
+      timestamp: '2026-06-10T00:03:00.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: {
+          total_token_usage: {
+            input_tokens: 130,
+            cached_input_tokens: 50,
+            output_tokens: 20,
+            reasoning_output_tokens: 5,
+            total_tokens: 150,
+          },
+        },
+      },
+    }),
+    '',
+  ].join('\n'));
+
+  const summary = await aggregateSessions({
+    sessionsDir: join(root, 'sessions'),
+    since: parseSince('2026-06-10'),
+  });
+  assert.deepEqual(
+    summary.byProjectModel.map((row) => [row.project, row.model, row.totalTokens]),
+    [['alpha', 'gpt-a', 110], ['beta', 'gpt-b', 40]],
+  );
+
+  const estimated = estimateCosts(summary, {
+    source: 'test',
+    path: 'test',
+    rawCount: 2,
+    models: new Map([
+      ['gpt-a', {
+        name: 'gpt-a',
+        inputCostPerToken: 0.000001,
+        cachedInputCostPerToken: 0.0000001,
+        outputCostPerToken: 0.000002,
+      }],
+      ['gpt-b', {
+        name: 'gpt-b',
+        inputCostPerToken: 0.000002,
+        cachedInputCostPerToken: 0.000001,
+        outputCostPerToken: 0.000004,
+      }],
+    ]),
+  });
+
+  assert.deepEqual(
+    estimated.byProject.map((row) => [row.project, row.totalTokens]),
+    [['beta', 40], ['alpha', 110]],
+  );
+  assert.equal(estimated.byProject[0].costUsd.toFixed(6), '0.000090');
+  assert.equal(estimated.byProject[1].costUsd.toFixed(6), '0.000084');
+});
+
 test('parses tmux bottom pane options', () => {
   const parsed = parseArgs([
     'since',
@@ -187,6 +299,27 @@ test('parses managed launch and codex passthrough args', () => {
   assert.deepEqual(parsed.options.codexArgs, ['--model', 'gpt-5']);
 });
 
+test('parses new commands and output flags', () => {
+  const budget = parseArgs(['budget', '--daily', '10', '--weekly', '50']);
+  assert.deepEqual(budget.budget.set, { daily: 10, weekly: 50 });
+
+  const budgetStatus = parseArgs(['budget', '--status']);
+  assert.equal(budgetStatus.budget.status, true);
+
+  const doctor = parseArgs(['doctor']);
+  assert.equal(doctor.doctor, true);
+
+  const marker = parseArgs(['since-mark', 'sprint-24', '--models', '--projects', '--csv']);
+  assert.equal(marker.sinceMarkName, 'sprint-24');
+  assert.equal(marker.options.models, true);
+  assert.equal(marker.options.projects, true);
+  assert.equal(marker.options.csv, true);
+
+  const mark = parseArgs(['mark', 'sprint-24']);
+  assert.equal(mark.markerAction, 'mark');
+  assert.equal(mark.markerName, 'sprint-24');
+});
+
 test('selects pty footer launch mode when tmux is unavailable in a tty', () => {
   assert.deepEqual(
     selectLaunchMode({ tmuxBin: null, stdinIsTTY: true, stdoutIsTTY: true }),
@@ -207,6 +340,114 @@ test('formats pty footer lines to exactly one terminal row', () => {
   assert.equal(fitTerminalLine('abcdef', 5), 'abcde');
   assert.equal(fitTerminalLine('a\nb\rc', 5), 'a b c');
   assert.equal(exitCodeFromSignal('SIGINT'), 130);
+});
+
+test('formats compact budget/model output as one line', () => {
+  const summary = applyBudgetStatus({
+    since: '2026-06-10',
+    total: {
+      inputTokens: 100,
+      cachedInputTokens: 20,
+      outputTokens: 10,
+      reasoningOutputTokens: 0,
+      totalTokens: 110,
+      events: 1,
+    },
+    byModel: [
+      {
+        model: 'gpt-a',
+        inputTokens: 100,
+        cachedInputTokens: 20,
+        outputTokens: 10,
+        reasoningOutputTokens: 0,
+        totalTokens: 110,
+        events: 1,
+        costUsd: 12,
+      },
+    ],
+    cost: { usd: 12, pricedTokens: 110, unpricedTokens: 0, partial: false },
+  }, { budgets: { daily: 10 } });
+
+  const line = formatCompact(summary, { models: true, maxCols: 200 });
+  assert.equal(line.includes('\n'), false);
+  assert.match(line, /budget daily \$12\.0000\/\$10\.0000/);
+  assert.match(line, /top gpt-a \$12\.0000/);
+});
+
+test('stores budgets and calculates warnings', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'codex-meter-budget-'));
+  const configPath = join(root, 'config.json');
+  await saveBudgetConfig(configPath, { budgets: { daily: 5, weekly: 25 } });
+  const config = await loadBudgetConfig(configPath);
+  assert.deepEqual(config.budgets, { daily: 5, weekly: 25 });
+
+  const summary = applyBudgetStatus({
+    cost: { usd: 8 },
+    total: emptyTestUsage(),
+  }, config);
+  assert.equal(summary.budget.warning, true);
+  assert.deepEqual(summary.budget.exceeded.map((row) => row.period), ['daily']);
+});
+
+test('formats CSV with escaped fields and optional breakdowns', () => {
+  assert.equal(csvEscape('a,"b"'), '"a,""b"""');
+  const csv = formatCsv({
+    since: '2026-06-10',
+    total: {
+      inputTokens: 10,
+      cachedInputTokens: 4,
+      outputTokens: 2,
+      reasoningOutputTokens: 1,
+      totalTokens: 12,
+    },
+    cost: { usd: 0.5, pricedTokens: 12, partial: false },
+    byModel: [
+      {
+        model: 'gpt,a',
+        inputTokens: 10,
+        cachedInputTokens: 4,
+        outputTokens: 2,
+        reasoningOutputTokens: 1,
+        totalTokens: 12,
+        costUsd: 0.5,
+        priceMissing: false,
+      },
+    ],
+    byProject: [
+      {
+        project: 'repo "one"',
+        inputTokens: 10,
+        cachedInputTokens: 4,
+        outputTokens: 2,
+        reasoningOutputTokens: 1,
+        totalTokens: 12,
+        costUsd: 0.5,
+        priceMissing: false,
+      },
+    ],
+  }, { models: true, projects: true });
+
+  assert.match(csv, /^type,name,model,project,since,total_tokens/m);
+  assert.match(csv, /model,"gpt,a","gpt,a",/);
+  assert.match(csv, /project,"repo ""one""",,"repo ""one"""/);
+});
+
+test('stores markers and validates marker names', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'codex-meter-markers-'));
+  const markersPath = join(root, 'markers.json');
+  await saveMarkers(markersPath, {
+    markers: {
+      sprint_24: {
+        name: 'sprint_24',
+        since: '2026-06-10',
+        createdAt: '2026-06-10T00:00:00.000Z',
+      },
+    },
+  });
+  const markers = await loadMarkers(markersPath);
+  assert.equal(markers.markers.sprint_24.since, '2026-06-10');
+  assert.equal(isValidMarkerName('sprint-24'), true);
+  assert.equal(isValidMarkerName('../sprint'), false);
 });
 
 test('resolves codex command with test override', () => {

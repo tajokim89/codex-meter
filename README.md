@@ -21,8 +21,14 @@ codex-meter setup
 codex-meter launch since 2026-06-10
 codex-meter since 2026-06-10
 codex-meter since 2026-06-10 --status
+codex-meter since 2026-06-10 --models --projects
+codex-meter since 2026-06-10 --csv
 codex-meter since 2026-06-10 --watch --status
 codex-meter since 2026-06-10 --tmux
+codex-meter budget --daily 10 --weekly 50
+codex-meter doctor
+codex-meter mark sprint-24
+codex-meter since-mark sprint-24 --status
 codex-meter today
 codex-meter week
 ```
@@ -107,6 +113,8 @@ Use `--details` to show every model group:
 
 ```bash
 codex-meter since 2026-06-10 --details
+codex-meter since 2026-06-10 --models
+codex-meter since 2026-06-10 --projects
 ```
 
 By default, pricing is read only from the local cache:
@@ -132,6 +140,54 @@ For scripts or status bars, use:
 ```bash
 codex-meter since 2026-06-10 --status
 ```
+
+For CSV export:
+
+```bash
+codex-meter since 2026-06-10 --csv
+codex-meter since 2026-06-10 --models --projects --csv
+```
+
+## Budgets
+
+Set local budget guardrails:
+
+```bash
+codex-meter budget --daily 10
+codex-meter budget --weekly 50
+codex-meter budget --monthly 150
+codex-meter budget --status
+codex-meter budget --clear
+```
+
+Budgets are stored in `~/.config/codex-meter/config.json`. When estimated spend
+exceeds a configured budget, compact output and the live footer include a budget
+warning. The PTY footer uses a warning style when the terminal supports it.
+
+## Markers
+
+Create named reset points so you do not have to remember dates:
+
+```bash
+codex-meter mark sprint-24
+codex-meter marks
+codex-meter since-mark sprint-24 --status
+codex-meter remove-mark sprint-24
+```
+
+Markers are stored in `~/.config/codex-meter/markers.json`.
+
+## Doctor
+
+Run a read-only diagnostic:
+
+```bash
+codex-meter doctor
+```
+
+Doctor checks Node, the Codex and codex-meter binaries, shell wrapper,
+Codex status line config, session logs, price cache JSON, and node-pty spawn
+support.
 
 `--status` prints once and exits. It does not inject text into Codex's native
 footer. For a live bottom-pane display under Codex, launch Codex through
