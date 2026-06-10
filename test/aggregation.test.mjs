@@ -220,6 +220,8 @@ test('parses setup command config option', () => {
 
   assert.equal(parsed.setup, true);
   assert.equal(parsed.options.configPath, '/tmp/codex-config.toml');
+  assert.equal(parsed.options.shellIntegration, true);
+  assert.match(parsed.options.shellCommandArgs[1], /^\d{4}-\d{2}-\d{2}$/);
 });
 
 test('parses setup shell wrapper options', () => {
@@ -239,6 +241,11 @@ test('parses setup shell wrapper options', () => {
 
   const removeParsed = parseArgs(['setup', '--remove-shell']);
   assert.equal(removeParsed.options.removeShellIntegration, true);
+  assert.equal(removeParsed.options.shellIntegration, false);
+
+  const noShellParsed = parseArgs(['setup', '--no-shell']);
+  assert.equal(noShellParsed.options.noShellIntegration, true);
+  assert.equal(noShellParsed.options.shellIntegration, false);
 });
 
 test('upserts and removes managed shell wrapper block', () => {

@@ -18,7 +18,6 @@ Run:
 
 ```bash
 codex-meter setup
-codex-meter setup --shell since 2026-06-10
 codex-meter launch since 2026-06-10
 codex-meter since 2026-06-10
 codex-meter since 2026-06-10 --status
@@ -59,16 +58,12 @@ codex-meter setup
 
 This configures Codex's built-in `[tui].status_line` with token and limit items
 similar to OMX setup. Codex owns that footer and only supports built-in item IDs
-there, so the custom since/cost meter is drawn by `codex-meter launch`.
+there, so `setup` also installs a managed shell wrapper that makes the normal
+`codex` command start with the live since/cost meter automatically.
 
-To make the normal `codex` command start with the live meter automatically, run:
-
-```bash
-codex-meter setup --shell since 2026-06-10
-```
-
-This writes a managed shell function to your detected shell rc file, usually
-`~/.zshrc`:
+By default, the wrapper starts counting from the date when `setup` is run. For
+example, if you run setup on June 10, 2026, it writes this managed shell function
+to your detected shell rc file, usually `~/.zshrc`:
 
 ```sh
 codex() {
@@ -81,6 +76,18 @@ Open a new terminal, then use Codex normally:
 ```bash
 codex
 codex --model gpt-5
+```
+
+To choose a different start date during setup:
+
+```bash
+codex-meter setup --shell since 2026-06-10
+```
+
+To configure only Codex's built-in status line and skip the shell wrapper:
+
+```bash
+codex-meter setup --no-shell
 ```
 
 To remove only the shell wrapper:

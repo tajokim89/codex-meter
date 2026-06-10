@@ -38,7 +38,7 @@ const DEFAULT_CODEX_STATUS_LINE = [
 function usage() {
   return [
     'Usage:',
-    '  codex-meter setup [--shell since YYYY-MM-DD|today|week]',
+    '  codex-meter setup [--shell since YYYY-MM-DD|today|week] [--no-shell]',
     '  codex-meter setup --remove-shell',
     '  codex-meter launch since YYYY-MM-DD [-- CODEX_ARGS...]',
     '  codex-meter launch today [-- CODEX_ARGS...]',
@@ -61,8 +61,9 @@ function usage() {
     '  --tmux-height LINES     Bottom tmux pane height (default: 2)',
     '  --json                  Print machine-readable JSON',
     '  --details               Include per-model rows in text output',
-    '  --shell since DATE      Make `codex` run through codex-meter launch',
-    '  --shell-file PATH       Shell rc file for --shell (default: detected shell rc)',
+    '  --shell since DATE      Override setup shell wrapper range',
+    '  --shell-file PATH       Shell rc file for setup wrapper (default: detected shell rc)',
+    '  --no-shell              Do not install the setup shell wrapper',
     '  --remove-shell          Remove the managed codex shell wrapper',
     '  -- CODEX_ARGS...        Extra arguments passed to codex in launch mode',
     '  --help                  Show this help',
@@ -87,6 +88,7 @@ function parseArgs(argv) {
     details: false,
     codexArgs: [],
     shellIntegration: false,
+    noShellIntegration: false,
     removeShellIntegration: false,
     shellFile: DEFAULT_SHELL_RC,
     shellCommandArgs: null,
@@ -110,6 +112,9 @@ function parseArgs(argv) {
         case '--shell-file':
           options.shellFile = requireValue(arg, args);
           break;
+        case '--no-shell':
+          options.noShellIntegration = true;
+          break;
         case '--remove-shell':
           options.removeShellIntegration = true;
           break;
@@ -120,8 +125,15 @@ function parseArgs(argv) {
           throw new Error(`unknown option: ${arg}`);
       }
     }
-    if (options.shellIntegration && options.removeShellIntegration) {
-      throw new Error('--shell and --remove-shell cannot be used together');
+    if (options.shellIntegration && options.noShellIntegration) {
+      throw new Error('--shell and --no-shell cannot be used together');
+    }
+    if (options.removeShellIntegration && (options.shellIntegration || options.noShellIntegration)) {
+      throw new Error('--remove-shell cannot be combined with --shell or --no-shell');
+    }
+    if (!options.removeShellIntegration && !options.noShellIntegration) {
+      options.shellIntegration = true;
+      options.shellCommandArgs ??= defaultSetupShellCommand();
     }
     return { setup: true, options };
   }
@@ -218,6 +230,10 @@ function parseSetupShellCommand(args) {
     return [command];
   }
   throw new Error('--shell requires since YYYY-MM-DD, today, or week');
+}
+
+function defaultSetupShellCommand() {
+  return ['since', formatDateLocal(new Date())];
 }
 
 function requireValue(flag, args) {
