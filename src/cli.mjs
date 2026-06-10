@@ -1,6 +1,15 @@
 #!/usr/bin/env node
-import { readFile, writeFile, mkdir, readdir } from 'node:fs/promises';
-import { chmodSync, createReadStream, existsSync, realpathSync, statSync } from 'node:fs';
+import { readFile, writeFile, mkdir, readdir, unlink } from 'node:fs/promises';
+import {
+  chmodSync,
+  closeSync,
+  createReadStream,
+  existsSync,
+  openSync,
+  readSync,
+  realpathSync,
+  statSync,
+} from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { join, resolve, dirname, delimiter, basename } from 'node:path';
@@ -19,6 +28,7 @@ const DEFAULT_SESSIONS_DIR = join(homedir(), '.codex', 'sessions');
 const DEFAULT_CODEX_CONFIG = join(homedir(), '.codex', 'config.toml');
 const DEFAULT_APP_CONFIG = join(homedir(), '.config', 'codex-meter', 'config.json');
 const DEFAULT_MARKERS_FILE = join(homedir(), '.config', 'codex-meter', 'markers.json');
+const DEFAULT_SHIM_DIR = join(homedir(), '.local', 'share', 'codex-meter', 'bin');
 const DEFAULT_SHELL_RC = defaultShellRcPath();
 const DEFAULT_TMUX_HEIGHT = 2;
 const PTY_FOOTER_HEIGHT = 1;
@@ -43,16 +53,17 @@ function usage() {
     'Usage:',
     '  codex-meter setup [--shell since YYYY-MM-DD|today|week] [--no-shell]',
     '  codex-meter setup --remove-shell',
-    '  codex-meter launch since YYYY-MM-DD [-- CODEX_ARGS...]',
-    '  codex-meter launch today [-- CODEX_ARGS...]',
-    '  codex-meter launch week [-- CODEX_ARGS...]',
+    '  codex-meter launch since YYYY-MM-DD [CODEX_ARGS...]',
+    '  codex-meter launch today [CODEX_ARGS...]',
+    '  codex-meter launch week [CODEX_ARGS...]',
+    '  codex-meter since YYYY-MM-DD [CODEX_ARGS...]',
     '  codex-meter budget --daily USD|--weekly USD|--monthly USD|--clear|--status',
     '  codex-meter doctor',
     '  codex-meter mark NAME',
     '  codex-meter marks',
     '  codex-meter since-mark NAME [--watch] [--status] [--json]',
     '  codex-meter remove-mark NAME',
-    '  codex-meter since YYYY-MM-DD [--watch] [--status] [--json]',
+    '  codex-meter since YYYY-MM-DD --status|--json|--csv',
     '  codex-meter today [--watch] [--status] [--json]',
     '  codex-meter week [--watch] [--status] [--json]',
     '',
@@ -66,7 +77,7 @@ function usage() {
     '  --interval SECONDS      Watch interval (default: 2)',
     '  --status                Print one compact line',
     '  --launch                Launch Codex with a live meter pane/footer',
-    '  --tmux                  Open a bottom tmux pane and run live compact status there',
+    '  --tmux                  Use tmux explicitly; for since, open a bottom pane',
     '  --tmux-height LINES     Bottom tmux pane height (default: 2)',
     '  --json                  Print machine-readable JSON',
     '  --csv                   Print CSV to stdout',
@@ -75,9 +86,10 @@ function usage() {
     '  --projects              Include per-project rows',
     '  --shell since DATE      Override setup shell wrapper range',
     '  --shell-file PATH       Shell rc file for setup wrapper (default: detected shell rc)',
+    '  --shim-dir PATH         Directory for managed codex shim (default: ~/.local/share/codex-meter/bin)',
     '  --no-shell              Do not install the setup shell wrapper',
     '  --remove-shell          Remove the managed codex shell wrapper',
-    '  -- CODEX_ARGS...        Extra arguments passed to codex in launch mode',
+    '  CODEX_ARGS...           Extra arguments passed to codex in launch mode',
     '  --help                  Show this help',
   ].join('\n');
 }
@@ -108,6 +120,7 @@ function parseArgs(argv) {
     noShellIntegration: false,
     removeShellIntegration: false,
     shellFile: DEFAULT_SHELL_RC,
+    shimDir: DEFAULT_SHIM_DIR,
     shellCommandArgs: null,
   };
 
@@ -150,6 +163,9 @@ function parseArgs(argv) {
           break;
         case '--shell-file':
           options.shellFile = requireValue(arg, args);
+          break;
+        case '--shim-dir':
+          options.shimDir = requireValue(arg, args);
           break;
         case '--no-shell':
           options.noShellIntegration = true;
@@ -263,11 +279,9 @@ function parseArgs(argv) {
       case '--projects':
         options.projects = true;
         break;
-      case '--help':
-      case '-h':
-        return { help: true, options };
       default:
-        throw new Error(`unknown option: ${arg}`);
+        options.codexArgs = [arg, ...args.splice(0)];
+        break;
     }
   }
 
@@ -289,6 +303,9 @@ function parseSharedReadOptions(args, options) {
         break;
       case '--shell-file':
         options.shellFile = requireValue(arg, args);
+        break;
+      case '--shim-dir':
+        options.shimDir = requireValue(arg, args);
         break;
       case '--help':
       case '-h':
@@ -955,6 +972,7 @@ async function runDoctor({ options }) {
   checks.push(checkCommandAvailable('codex-meter'));
   checks.push(checkCommandAvailable('codex'));
   checks.push(await checkShellWrapper(options.shellFile));
+  checks.push(await checkCodexShim(options.shimDir));
   checks.push(await checkCodexStatusLine(options.configPath));
   checks.push(await checkSessionLogs(options.sessionsDir));
   checks.push(await checkPriceCache(options.pricePath));
@@ -1000,6 +1018,7 @@ async function checkShellWrapper(shellFile) {
     const text = await readFile(shellFile, 'utf8');
     const ok = text.includes(SHELL_BLOCK_START)
       && text.includes('codex-meter launch')
+      && text.includes('CODEX_METER_CODEX_BIN')
       && text.includes('codex()');
     return {
       name: 'shell wrapper',
@@ -1012,6 +1031,31 @@ async function checkShellWrapper(shellFile) {
       name: 'shell wrapper',
       ok: false,
       detail: `${shellFile}: ${error.code ?? error.message}`,
+      fix: 'run codex-meter setup',
+    };
+  }
+}
+
+async function checkCodexShim(shimDir) {
+  const shimPath = codexShimPath(shimDir);
+  try {
+    const text = await readFile(shimPath, 'utf8');
+    const executable = process.platform === 'win32' || (statSync(shimPath).mode & 0o111) !== 0;
+    const ok = text.includes('codex-meter:managed-codex-shim')
+      && text.includes('CODEX_METER_CODEX_BIN')
+      && text.includes('codex-meter launch')
+      && executable;
+    return {
+      name: 'codex shim',
+      ok,
+      detail: shimPath,
+      fix: 'run codex-meter setup',
+    };
+  } catch (error) {
+    return {
+      name: 'codex shim',
+      ok: false,
+      detail: `${shimPath}: ${error.code ?? error.message}`,
       fix: 'run codex-meter setup',
     };
   }
@@ -1128,15 +1172,30 @@ async function setupCodex({ options }) {
   await setupCodexStatusLine(options);
   if (options.removeShellIntegration) {
     await removeCodexShellIntegration({ shellFile: options.shellFile });
+    await removeCodexShim({ shimDir: options.shimDir });
   } else if (options.shellIntegration) {
+    const codexBin = resolveCodexBinaryForIntegration({ shimDir: options.shimDir });
+    await setupCodexShim({
+      shimDir: options.shimDir,
+      commandArgs: options.shellCommandArgs,
+      codexBin,
+    });
     await setupCodexShellIntegration({
       shellFile: options.shellFile,
+      shimDir: options.shimDir,
       commandArgs: options.shellCommandArgs,
+      codexBin,
     });
   }
 }
 
-async function setupCodexShellIntegration({ shellFile, commandArgs }) {
+async function setupCodexShellIntegration({
+  shellFile,
+  shimDir,
+  commandArgs,
+  codexBin,
+  quiet = false,
+}) {
   let current = '';
   try {
     current = await readFile(shellFile, 'utf8');
@@ -1144,11 +1203,43 @@ async function setupCodexShellIntegration({ shellFile, commandArgs }) {
     if (error.code !== 'ENOENT') throw error;
   }
 
-  const updated = upsertShellIntegrationText(current, commandArgs);
+  const updated = upsertShellIntegrationText(current, commandArgs, { shimDir, codexBin });
   await mkdir(dirname(shellFile), { recursive: true });
   await writeFile(shellFile, updated);
-  process.stdout.write(`codex-meter shell wrapper updated ${shellFile}\n`);
-  process.stdout.write(`New shells will run \`codex\` as \`codex-meter launch ${commandArgs.join(' ')} -- "$@"\`.\n`);
+  if (!quiet) {
+    process.stdout.write(`codex-meter shell wrapper updated ${shellFile}\n`);
+    process.stdout.write(`New shells will run \`codex\` and \`codex resume\` through \`codex-meter launch ${commandArgs.join(' ')} -- "$@"\`.\n`);
+  }
+}
+
+async function setupCodexShim({ shimDir, commandArgs, codexBin, quiet = false }) {
+  const shimPath = codexShimPath(shimDir);
+  await mkdir(dirname(shimPath), { recursive: true });
+  await writeFile(shimPath, buildCodexShimScript({ commandArgs, codexBin }));
+  if (process.platform !== 'win32') {
+    chmodSync(shimPath, 0o755);
+  }
+  if (!quiet) {
+    process.stdout.write(`codex-meter codex shim updated ${shimPath}\n`);
+    process.stdout.write(`Underlying Codex binary: ${codexBin}\n`);
+  }
+}
+
+async function persistCodexLaunchDefault({ commandArgs, options }) {
+  const codexBin = resolveCodexBinaryForIntegration({ shimDir: options.shimDir });
+  await setupCodexShim({
+    shimDir: options.shimDir,
+    commandArgs,
+    codexBin,
+    quiet: true,
+  });
+  await setupCodexShellIntegration({
+    shellFile: options.shellFile,
+    shimDir: options.shimDir,
+    commandArgs,
+    codexBin,
+    quiet: true,
+  });
 }
 
 async function removeCodexShellIntegration({ shellFile }) {
@@ -1168,6 +1259,20 @@ async function removeCodexShellIntegration({ shellFile }) {
   process.stdout.write(`codex-meter shell wrapper removed from ${shellFile}\n`);
 }
 
+async function removeCodexShim({ shimDir }) {
+  const shimPath = codexShimPath(shimDir);
+  try {
+    await unlink(shimPath);
+    process.stdout.write(`codex-meter codex shim removed from ${shimPath}\n`);
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      process.stdout.write(`codex-meter codex shim not found in ${shimPath}\n`);
+      return;
+    }
+    throw error;
+  }
+}
+
 function defaultShellRcPath(env = process.env) {
   const shell = basename(env.SHELL ?? '');
   if (shell === 'bash') return join(homedir(), '.bashrc');
@@ -1175,10 +1280,13 @@ function defaultShellRcPath(env = process.env) {
   return join(homedir(), '.profile');
 }
 
-function upsertShellIntegrationText(configText, commandArgs) {
+function upsertShellIntegrationText(configText, commandArgs, {
+  shimDir = DEFAULT_SHIM_DIR,
+  codexBin = 'codex',
+} = {}) {
   const text = removeManagedShellIntegrationText(configText);
   const prefix = text.length === 0 || text.endsWith('\n') ? text : `${text}\n`;
-  return `${prefix}\n${buildShellIntegrationBlock(commandArgs)}`;
+  return `${prefix}\n${buildShellIntegrationBlock({ commandArgs, shimDir, codexBin })}`;
 }
 
 function removeManagedShellIntegrationText(configText) {
@@ -1193,17 +1301,51 @@ function removeManagedShellIntegrationText(configText) {
   return `${before}${after}`;
 }
 
-function buildShellIntegrationBlock(commandArgs) {
+function buildShellIntegrationBlock({ commandArgs, shimDir, codexBin }) {
   const launchArgs = commandArgs.map(shellEscape).join(' ');
+  const escapedShimDir = shellEscape(shimDir);
+  const escapedCodexBin = shellEscape(codexBin);
   return [
     SHELL_BLOCK_START,
     '# Managed by codex-meter. Remove with: codex-meter setup --remove-shell',
+    `_codex_meter_bin_dir=${escapedShimDir}`,
+    'case ":$PATH:" in',
+    '  *":$_codex_meter_bin_dir:"*) ;;',
+    '  *) export PATH="$_codex_meter_bin_dir:$PATH" ;;',
+    'esac',
+    'unset _codex_meter_bin_dir',
     'codex() {',
-    `  command codex-meter launch ${launchArgs} -- "$@"`,
+    `  env CODEX_METER_CODEX_BIN=${escapedCodexBin} codex-meter launch ${launchArgs} -- "$@"`,
     '}',
     SHELL_BLOCK_END,
     '',
   ].join('\n');
+}
+
+function buildCodexShimScript({ commandArgs, codexBin }) {
+  if (process.platform === 'win32') {
+    const launchArgs = commandArgs.map(windowsCmdArgEscape).join(' ');
+    return [
+      '@echo off',
+      'rem codex-meter:managed-codex-shim',
+      `set "CODEX_METER_CODEX_BIN=${String(codexBin).replace(/"/g, '""')}"`,
+      `codex-meter launch ${launchArgs} -- %*`,
+      '',
+    ].join('\r\n');
+  }
+
+  const launchArgs = commandArgs.map(shellEscape).join(' ');
+  return [
+    '#!/bin/sh',
+    '# codex-meter:managed-codex-shim',
+    `export CODEX_METER_CODEX_BIN=${shellEscape(codexBin)}`,
+    `exec codex-meter launch ${launchArgs} -- "$@"`,
+    '',
+  ].join('\n');
+}
+
+function codexShimPath(shimDir = DEFAULT_SHIM_DIR) {
+  return join(shimDir, process.platform === 'win32' ? 'codex.cmd' : 'codex');
 }
 
 function upsertCodexStatusLineText(configText) {
@@ -1446,6 +1588,18 @@ function formatCsv(summary, options) {
   ].join('\n');
 }
 
+function shouldDefaultLaunch(parsed) {
+  if (!parsed.since || parsed.options.launch || parsed.options.tmux) return false;
+  const outputOnly = parsed.options.status
+    || parsed.options.json
+    || parsed.options.csv
+    || parsed.options.details
+    || parsed.options.models
+    || parsed.options.projects
+    || parsed.options.watch;
+  return !outputOnly;
+}
+
 function csvUsageRow(type, name, usage, extra = {}) {
   const cached = usage.cachedInputTokens ?? 0;
   const input = usage.inputTokens ?? 0;
@@ -1582,10 +1736,13 @@ async function launchTmuxPane({ commandArgs, options }) {
 }
 
 async function launchManagedCodexSession({ commandArgs, since, options }) {
-  const launchMode = selectLaunchMode();
+  const launchMode = selectLaunchMode({ forceTmux: options.tmux });
   if (launchMode.kind === 'pty-footer') {
     await launchPtyFooterSession({ since, options });
     return;
+  }
+  if (launchMode.kind === 'tmux-unavailable') {
+    throw new Error('managed tmux launch requires a working tmux or psmux binary on PATH.');
   }
   if (launchMode.kind === 'unsupported') {
     throw new Error('no-tmux launch mode requires an interactive terminal.');
@@ -1598,7 +1755,8 @@ async function launchManagedCodexSession({ commandArgs, since, options }) {
 
   const sessionName = buildManagedSessionName();
   const meterCommand = buildMeterWatchCommand(commandArgs, options);
-  const codexCommand = buildCodexLeaderCommand(options.codexArgs, sessionName, tmuxBin);
+  const codexBin = resolveCodexCommandForLaunch(options);
+  const codexCommand = buildCodexLeaderCommand(options.codexArgs, sessionName, tmuxBin, codexBin);
   let createdSession = false;
 
   try {
@@ -1644,8 +1802,11 @@ function selectLaunchMode({
   tmuxBin = resolveWorkingTmuxBinary(),
   stdinIsTTY = process.stdin.isTTY,
   stdoutIsTTY = process.stdout.isTTY,
+  forceTmux = false,
 } = {}) {
-  if (tmuxBin) return { kind: 'tmux', tmuxBin };
+  if (forceTmux) {
+    return tmuxBin ? { kind: 'tmux', tmuxBin } : { kind: 'tmux-unavailable' };
+  }
   if (!stdinIsTTY || !stdoutIsTTY) return { kind: 'unsupported' };
   return { kind: 'pty-footer' };
 }
@@ -1667,7 +1828,7 @@ async function launchPtyFooterSession({ since, options }) {
   }
 
   const initialSize = currentPtyFooterSize();
-  const child = pty.spawn(resolveCodexCommand(), options.codexArgs, {
+  const child = pty.spawn(resolveCodexCommandForLaunch(options), options.codexArgs, {
     name: process.env.TERM || 'xterm-256color',
     cols: initialSize.cols,
     rows: initialSize.childRows,
@@ -1704,6 +1865,7 @@ async function launchPtyFooterSession({ since, options }) {
     }
     process.stdout.write('\x1b[r\x1b[0m\x1b[?25h');
     clearFooterRow();
+    clearTerminalScreen();
   };
   restoreTerminal.done = false;
 
@@ -1785,6 +1947,32 @@ function resolveCodexCommand(env = process.env) {
   return typeof override === 'string' && override.trim() ? override.trim() : 'codex';
 }
 
+function resolveCodexCommandForLaunch(options = {}, env = process.env) {
+  const override = env.CODEX_METER_CODEX_BIN;
+  if (typeof override === 'string' && override.trim()) {
+    return override.trim();
+  }
+  return resolveCodexBinaryForIntegration({ shimDir: options.shimDir, env });
+}
+
+function resolveCodexBinaryForIntegration({ shimDir = DEFAULT_SHIM_DIR, env = process.env } = {}) {
+  const override = env.CODEX_METER_CODEX_BIN;
+  if (typeof override === 'string' && override.trim()) {
+    return override.trim();
+  }
+
+  const managedShimPath = codexShimPath(shimDir);
+  const resolved = resolveCommandPath('codex', {
+    env,
+    reject: (candidate) => samePath(candidate, managedShimPath) || hasManagedCodexShimMarker(candidate),
+  });
+  if (resolved) return resolved;
+  throw new Error(
+    'codex binary not found on PATH outside the managed codex-meter shim. '
+    + 'Install the Codex CLI or set CODEX_METER_CODEX_BIN to the real codex binary before running setup.',
+  );
+}
+
 function ensureNodePtySpawnHelperExecutable() {
   if (process.platform === 'win32') return;
   let packageRoot;
@@ -1833,6 +2021,10 @@ function clearFooterRow() {
   process.stdout.write(`\x1b7\x1b[${footerRow};1H\x1b[2K\x1b8`);
 }
 
+function clearTerminalScreen() {
+  process.stdout.write('\x1b[2J\x1b[H');
+}
+
 function fitTerminalLine(line, cols) {
   const normalized = String(line).replace(/[\r\n]+/g, ' ');
   if (normalized.length >= cols) return normalized.slice(0, cols);
@@ -1877,14 +2069,16 @@ function resolveTmuxBinary() {
   return null;
 }
 
-function resolveCommandPath(command) {
-  const pathEntries = String(process.env.PATH ?? process.env.Path ?? '')
+function resolveCommandPath(command, { env = process.env, reject = null } = {}) {
+  const pathEntries = String(env.PATH ?? env.Path ?? '')
     .split(delimiter)
     .map((entry) => entry.trim())
     .filter(Boolean);
   for (const entry of pathEntries) {
     const candidate = resolve(entry, command);
-    if (isFile(candidate)) return candidate;
+    if (!isFile(candidate)) continue;
+    if (reject?.(candidate)) continue;
+    return candidate;
   }
   return null;
 }
@@ -1897,16 +2091,45 @@ function isFile(path) {
   }
 }
 
+function samePath(a, b) {
+  try {
+    return realpathSync(a) === realpathSync(b);
+  } catch {
+    return resolve(a) === resolve(b);
+  }
+}
+
+function hasManagedCodexShimMarker(path) {
+  let fd;
+  try {
+    fd = openSync(path, 'r');
+    const buffer = Buffer.alloc(1024);
+    const bytesRead = readSync(fd, buffer, 0, buffer.length, 0);
+    return buffer.toString('utf8', 0, bytesRead).includes('codex-meter:managed-codex-shim');
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        // Ignore close failures during PATH probing.
+      }
+    }
+  }
+}
+
 function buildManagedSessionName() {
   return `codex-meter-${process.pid}-${Date.now().toString(36)}`;
 }
 
-function buildCodexLeaderCommand(codexArgs, sessionName, tmuxBin) {
-  const codexCommand = ['codex', ...codexArgs].map(shellEscape).join(' ');
+function buildCodexLeaderCommand(codexArgs, sessionName, tmuxBin, codexBin = resolveCodexCommand()) {
+  const codexCommand = [codexBin, ...codexArgs].map(shellEscape).join(' ');
   const closeSessionCommand = `${shellEscape(tmuxBin)} kill-session -t ${shellEscape(sessionName)} >/dev/null 2>&1 || true`;
   const script = [
     codexCommand,
     'status=$?',
+    'clear 2>/dev/null || printf "\\033[2J\\033[H"',
     'if [ "$status" -ne 0 ]; then',
     '  printf "\\n[codex-meter] codex exited with code %s. Press Enter to close this session.\\n" "$status" >&2',
     '  IFS= read -r _codex_meter_close || true',
@@ -1919,6 +2142,10 @@ function buildCodexLeaderCommand(codexArgs, sessionName, tmuxBin) {
 
 function shellEscape(value) {
   return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
+function windowsCmdArgEscape(value) {
+  return `"${String(value).replace(/"/g, '""')}"`;
 }
 
 async function main() {
@@ -1946,6 +2173,12 @@ async function main() {
       parsed = await resolveSinceMarker(parsed);
       if (parsed.setup) {
         await setupCodex(parsed);
+      } else if (shouldDefaultLaunch(parsed)) {
+        await persistCodexLaunchDefault(parsed);
+        await launchManagedCodexSession({
+          ...parsed,
+          options: { ...parsed.options, launch: true },
+        });
       } else if (parsed.options.launch) {
         await launchManagedCodexSession(parsed);
       } else if (parsed.options.tmux) {
@@ -1980,6 +2213,9 @@ if (isDirectRun()) {
 export {
   aggregateSessions,
   applyBudgetStatus,
+  buildCodexLeaderCommand,
+  buildCodexShimScript,
+  codexShimPath,
   csvEscape,
   estimateCosts,
   exitCodeFromSignal,
@@ -1992,10 +2228,12 @@ export {
   loadMarkers,
   parseArgs,
   parseSince,
+  resolveCodexBinaryForIntegration,
   resolveCodexCommand,
   saveBudgetConfig,
   saveMarkers,
   selectLaunchMode,
+  shouldDefaultLaunch,
   upsertShellIntegrationText,
   removeManagedShellIntegrationText,
   upsertCodexStatusLineText,

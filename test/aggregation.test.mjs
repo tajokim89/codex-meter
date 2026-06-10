@@ -1,11 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   aggregateSessions,
   applyBudgetStatus,
+  buildCodexLeaderCommand,
+  buildCodexShimScript,
+  codexShimPath,
   csvEscape,
   estimateCosts,
   exitCodeFromSignal,
@@ -17,10 +20,12 @@ import {
   loadMarkers,
   parseArgs,
   parseSince,
+  resolveCodexBinaryForIntegration,
   resolveCodexCommand,
   saveBudgetConfig,
   saveMarkers,
   selectLaunchMode,
+  shouldDefaultLaunch,
   removeManagedShellIntegrationText,
   upsertShellIntegrationText,
   upsertCodexStatusLineText,
@@ -299,6 +304,65 @@ test('parses managed launch and codex passthrough args', () => {
   assert.deepEqual(parsed.options.codexArgs, ['--model', 'gpt-5']);
 });
 
+test('passes codex args after separator without interpreting them', () => {
+  const parsed = parseArgs([
+    'since',
+    '2026-06-10',
+    '--',
+    '--model',
+    'gpt-5',
+    'resume',
+    '--last',
+    '--dangerously-bypass-approvals-and-sandbox',
+  ]);
+
+  assert.deepEqual(parsed.commandArgs, ['since', '2026-06-10']);
+  assert.equal(shouldDefaultLaunch(parsed), true);
+  assert.deepEqual(parsed.options.codexArgs, [
+    '--model',
+    'gpt-5',
+    'resume',
+    '--last',
+    '--dangerously-bypass-approvals-and-sandbox',
+  ]);
+});
+
+test('passes unknown options and positional args to codex without separator', () => {
+  const model = parseArgs(['since', '2026-06-10', '--model', 'gpt-5', '--reasoning-effort', 'high']);
+  assert.equal(shouldDefaultLaunch(model), true);
+  assert.deepEqual(model.options.codexArgs, ['--model', 'gpt-5', '--reasoning-effort', 'high']);
+
+  const resume = parseArgs(['since', '2026-06-10', 'resume', '--last']);
+  assert.equal(shouldDefaultLaunch(resume), true);
+  assert.deepEqual(resume.options.codexArgs, ['resume', '--last']);
+
+  const exec = parseArgs(['launch', 'since', '2026-06-10', 'exec', '--sandbox', 'workspace-write', 'echo ok']);
+  assert.equal(exec.options.launch, true);
+  assert.deepEqual(exec.options.codexArgs, ['exec', '--sandbox', 'workspace-write', 'echo ok']);
+
+  const arbitrary = parseArgs(['since', '2026-06-10', 'future-command', '--future-flag', 'value']);
+  assert.equal(shouldDefaultLaunch(arbitrary), true);
+  assert.deepEqual(arbitrary.options.codexArgs, ['future-command', '--future-flag', 'value']);
+});
+
+test('plain since launches by default but output modes stay report-only', () => {
+  const plain = parseArgs(['since', '2026-06-10']);
+  assert.equal(shouldDefaultLaunch(plain), true);
+
+  const resume = parseArgs(['since', '2026-06-10', 'resume']);
+  assert.equal(shouldDefaultLaunch(resume), true);
+  assert.deepEqual(resume.options.codexArgs, ['resume']);
+
+  const status = parseArgs(['since', '2026-06-10', '--status']);
+  assert.equal(shouldDefaultLaunch(status), false);
+
+  const explicitLaunch = parseArgs(['launch', 'since', '2026-06-10']);
+  assert.equal(shouldDefaultLaunch(explicitLaunch), false);
+
+  const tmuxPane = parseArgs(['since', '2026-06-10', '--tmux']);
+  assert.equal(shouldDefaultLaunch(tmuxPane), false);
+});
+
 test('parses new commands and output flags', () => {
   const budget = parseArgs(['budget', '--daily', '10', '--weekly', '50']);
   assert.deepEqual(budget.budget.set, { daily: 10, weekly: 50 });
@@ -320,14 +384,27 @@ test('parses new commands and output flags', () => {
   assert.equal(mark.markerName, 'sprint-24');
 });
 
-test('selects pty footer launch mode when tmux is unavailable in a tty', () => {
+test('selects pty footer launch mode by default even when tmux is available', () => {
   assert.deepEqual(
     selectLaunchMode({ tmuxBin: null, stdinIsTTY: true, stdoutIsTTY: true }),
     { kind: 'pty-footer' },
   );
   assert.deepEqual(
     selectLaunchMode({ tmuxBin: '/opt/homebrew/bin/tmux', stdinIsTTY: true, stdoutIsTTY: true }),
+    { kind: 'pty-footer' },
+  );
+  assert.deepEqual(
+    selectLaunchMode({
+      tmuxBin: '/opt/homebrew/bin/tmux',
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      forceTmux: true,
+    }),
     { kind: 'tmux', tmuxBin: '/opt/homebrew/bin/tmux' },
+  );
+  assert.deepEqual(
+    selectLaunchMode({ tmuxBin: null, stdinIsTTY: true, stdoutIsTTY: true, forceTmux: true }),
+    { kind: 'tmux-unavailable' },
   );
   assert.deepEqual(
     selectLaunchMode({ tmuxBin: null, stdinIsTTY: false, stdoutIsTTY: true }),
@@ -470,6 +547,8 @@ test('parses setup shell wrapper options', () => {
     'setup',
     '--shell-file',
     '/tmp/.zshrc',
+    '--shim-dir',
+    '/tmp/codex-meter-bin',
     '--shell',
     'since',
     '2026-06-10',
@@ -478,6 +557,7 @@ test('parses setup shell wrapper options', () => {
   assert.equal(parsed.setup, true);
   assert.equal(parsed.options.shellIntegration, true);
   assert.equal(parsed.options.shellFile, '/tmp/.zshrc');
+  assert.equal(parsed.options.shimDir, '/tmp/codex-meter-bin');
   assert.deepEqual(parsed.options.shellCommandArgs, ['since', '2026-06-10']);
 
   const removeParsed = parseArgs(['setup', '--remove-shell']);
@@ -490,16 +570,58 @@ test('parses setup shell wrapper options', () => {
 });
 
 test('upserts and removes managed shell wrapper block', () => {
-  const first = upsertShellIntegrationText('export EDITOR=vim\n', ['since', '2026-06-10']);
-  assert.match(first, /codex\(\) \{\n  command codex-meter launch 'since' '2026-06-10' -- "\$@"/);
+  const first = upsertShellIntegrationText('export EDITOR=vim\n', ['since', '2026-06-10'], {
+    shimDir: '/tmp/codex-meter-bin',
+    codexBin: '/usr/local/bin/codex',
+  });
+  assert.match(first, /export PATH="\$_codex_meter_bin_dir:\$PATH"/);
+  assert.match(first, /codex\(\) \{\n  env CODEX_METER_CODEX_BIN='\/usr\/local\/bin\/codex' codex-meter launch 'since' '2026-06-10' -- "\$@"/);
 
-  const second = upsertShellIntegrationText(first, ['today']);
+  const second = upsertShellIntegrationText(first, ['today'], {
+    shimDir: '/tmp/codex-meter-bin',
+    codexBin: '/usr/local/bin/codex',
+  });
   assert.equal((second.match(/codex-meter codex wrapper/g) ?? []).length, 2);
   assert.doesNotMatch(second, /2026-06-10/);
-  assert.match(second, /command codex-meter launch 'today' -- "\$@"/);
+  assert.match(second, /codex-meter launch 'today' -- "\$@"/);
 
   const removed = removeManagedShellIntegrationText(second);
   assert.equal(removed, 'export EDITOR=vim\n');
+});
+
+test('managed codex shim preserves codex subcommands including resume', () => {
+  const script = buildCodexShimScript({
+    commandArgs: ['since', '2026-06-10'],
+    codexBin: '/usr/local/bin/codex',
+  });
+
+  assert.match(script, /codex-meter:managed-codex-shim/);
+  assert.match(script, /export CODEX_METER_CODEX_BIN='\/usr\/local\/bin\/codex'/);
+  assert.match(script, /exec codex-meter launch 'since' '2026-06-10' -- "\$@"/);
+
+  const leaderCommand = buildCodexLeaderCommand(['resume'], 'session-name', '/usr/bin/tmux', '/usr/local/bin/codex');
+  assert.match(leaderCommand, /usr\/local\/bin\/codex/);
+  assert.match(leaderCommand, /resume/);
+  assert.match(leaderCommand, /clear 2>\/dev\/null/);
+});
+
+test('resolves real codex binary while skipping managed shim', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'codex-meter-shim-'));
+  const shimDir = join(root, 'shim-bin');
+  const realDir = join(root, 'real-bin');
+  await mkdir(shimDir, { recursive: true });
+  await mkdir(realDir, { recursive: true });
+  await writeFile(codexShimPath(shimDir), buildCodexShimScript({
+    commandArgs: ['today'],
+    codexBin: join(realDir, 'codex'),
+  }));
+  await writeFile(join(realDir, 'codex'), '#!/bin/sh\n');
+
+  const resolved = resolveCodexBinaryForIntegration({
+    shimDir,
+    env: { PATH: [shimDir, realDir].join(delimiter) },
+  });
+  assert.equal(resolved, join(realDir, 'codex'));
 });
 
 test('setup merges codex status line into existing tui table', () => {

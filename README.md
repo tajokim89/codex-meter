@@ -64,16 +64,18 @@ codex-meter setup
 
 This configures Codex's built-in `[tui].status_line` with token and limit items
 similar to OMX setup. Codex owns that footer and only supports built-in item IDs
-there, so `setup` also installs a managed shell wrapper that makes the normal
-`codex` command start with the live since/cost meter automatically.
+there, so `setup` also installs a managed `codex` shim plus a shell wrapper that
+makes the normal `codex` command start with the live since/cost meter
+automatically.
 
 By default, the wrapper starts counting from the date when `setup` is run. For
-example, if you run setup on June 10, 2026, it writes this managed shell function
-to your detected shell rc file, usually `~/.zshrc`:
+example, if you run setup on June 10, 2026, it writes this managed shell
+function to your detected shell rc file, usually `~/.zshrc`, and prepends the
+managed shim directory to `PATH`:
 
 ```sh
 codex() {
-  command codex-meter launch since 2026-06-10 -- "$@"
+  env CODEX_METER_CODEX_BIN=/path/to/real/codex codex-meter launch since 2026-06-10 -- "$@"
 }
 ```
 
@@ -81,8 +83,35 @@ Open a new terminal, then use Codex normally:
 
 ```bash
 codex
+codex resume
 codex --model gpt-5
 ```
+
+The shim is installed at `~/.local/share/codex-meter/bin/codex` by default. It
+passes every argument from `codex ...` through to the real Codex CLI, so
+subcommands such as `codex resume` continue to work while the meter stays
+attached.
+
+To change the default meter start date and launch Codex immediately:
+
+```bash
+codex-meter since 2026-06-10
+```
+
+That updates the managed `codex` wrapper, so later `codex`, `codex resume`, and
+other Codex arguments keep using that same meter range. After the meter range,
+Codex subcommands, prompts, and options can be written naturally:
+
+```bash
+codex-meter since 2026-06-10 resume
+codex-meter since 2026-06-10 resume --last
+codex-meter since 2026-06-10 --model gpt-5
+codex-meter since 2026-06-10 exec "npm test"
+```
+
+`--` still works as an optional separator if you want to force everything after
+it to Codex, but unknown options and positional args are already forwarded to
+Codex without needing the separator.
 
 To choose a different start date during setup:
 
@@ -101,6 +130,8 @@ To remove only the shell wrapper:
 ```bash
 codex-meter setup --remove-shell
 ```
+
+That also removes the managed shim. It does not uninstall Codex or codex-meter.
 
 ## Cost Estimates
 
@@ -197,19 +228,17 @@ footer. For a live bottom-pane display under Codex, launch Codex through
 codex-meter launch since 2026-06-10
 ```
 
-When `tmux` or `psmux` is available, `codex-meter` creates a managed session,
-starts Codex in the main pane, and starts the live meter in a small bottom pane.
-You do not need to run `tmux` yourself.
-
-When no terminal multiplexer is installed, `codex-meter launch` uses a PTY
-wrapper instead of falling back to plain `codex`. Codex runs normally in the top
-part of the terminal, and `codex-meter` reserves the last terminal row for a
-continuously updating local-only since/cost meter.
+By default, `codex-meter launch` uses a PTY wrapper even when `tmux` or `psmux`
+is installed. Codex runs normally in the top part of the terminal, and
+`codex-meter` reserves the last terminal row for a continuously updating
+local-only since/cost meter.
 
 The no-tmux wrapper uses `node-pty` because Codex is a full-screen terminal UI.
 PTY support is what lets `codex-meter` pass input through normally, resize the
 child terminal, preserve Codex's exit code, and draw a separate footer row
 without injecting text into the Codex conversation.
+When Codex exits, the wrapper restores the terminal and clears the screen once
+so the previous full-screen session does not remain behind.
 
 Pass Codex arguments after `--` when needed:
 
@@ -222,6 +251,12 @@ use:
 
 ```bash
 codex-meter since 2026-06-10 --tmux
+```
+
+To force the older managed tmux launch mode, pass `--tmux` to `launch`:
+
+```bash
+codex-meter launch since 2026-06-10 --tmux
 ```
 
 For a live inline display in the current terminal, use:
